@@ -1,0 +1,2168 @@
+---
+title: "another_test"
+output: html_document
+date: "2025-05-04"
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+## Improved System for Remaining Useful Life Prediction
+
+```{r load_libraries}
+# Core data manipulation and analysis
+library(dplyr)
+library(tidyr)
+library(readr)
+library(zoo)
+library(tidyverse)
+
+# Visualization
+library(ggplot2)
+library(corrplot)
+library(patchwork) # For combining plots
+
+# Machine learning
+library(caret)
+library(randomForest)
+library(xgboost)
+library(glmnet)
+library(e1071)
+library(lightgbm)
+
+# For parallel processing
+library(parallel)
+library(doParallel)
+
+library(keras)
+library(tensorflow)
+library(survival)
+library(survminer)
+library(wavelets)
+library(fftw)
+library(tsfeatures)
+library(iml)          # For model interpretation
+library(lime)         # For local interpretable model-agnostic explanations
+library(shapviz)      # For SHAP values
+library(h2o)
+```
+```{r}
+install.packages("h2o")
+
+```
+## Data Loading and Preparation
+
+```{r data_loading}
+# Define the structure of the NASA dataset
+file_ids <- c("FD001", "FD002", "FD003", "FD004")
+file_types <- c("train", "test", "RUL")
+
+# Column names based on the NASA Turbofan dataset documentation
+columns <- c('unit_number', 'time_in_cycles', 'setting_1', 'setting_2', 'setting_3', 
+             'T2', 'T24', 'T30', 'T50', 'P2', 'P15', 'P30', 'Nf', 'Nc', 'epr', 
+             'Ps30', 'phi', 'NRf', 'NRc', 'BPR', 'farB', 'htBleed', 'Nf_dmd', 
+             'PCNfR_dmd', 'W31', 'W32')
+
+# Improved function to load data
+load_data <- function(file_id, file_type) {
+  file_name <- paste0(file_type, "_", file_id, ".txt")
+  
+  if (!file.exists(file_name)) {
+    warning(paste("File not found:", file_name))
+    return(NULL)
+  }
+  
+  tryCatch({
+    # Read with readr for better performance
+    data <- read_delim(file_name,
+                     delim = " ",
+                     col_names = FALSE,
+                     trim_ws = TRUE,
+                     na = c("", "NA", "NaN"),
+                     skip_empty_rows = TRUE,
+                     show_col_types = FALSE)  # Suppress column type messages
+    
+    # Remove empty columns (common in space-delimited files)
+    data <- data[, colSums(!is.na(data)) > 0]
+    
+    # Apply column names if it's train or test file
+    if (file_type %in% c("train", "test")) {
+      # Make sure we don't run out of column names
+      if (ncol(data) <= length(columns)) {
+        colnames(data) <- columns[1:ncol(data)]
+      } else {
+        warning(paste("More columns than expected in", file_name))
+        colnames(data) <- c(columns, paste0("unknown_", 1:(ncol(data) - length(columns))))
+      }
+    } else if (file_type == "RUL") {
+      # For RUL files, use appropriate column name
+      colnames(data) <- "RUL"
+    }
+    
+    # Convert logical columns to numeric if necessary
+    data <- mutate_if(data, is.logical, as.numeric)
+    
+    # Convert to tibble for better handling
+    data <- as_tibble(data)
+    return(data)
+  }, error = function(e) {
+    warning(paste("Error loading", file_name, ":", e$message))
+    return(NULL)
+  })
+}
+
+# Load all datasets with better error handling
+data_list <- list()
+for (file_id in file_ids) {
+  for (file_type in c(file_types, "RUL")) {  # Include RUL files
+    key <- paste0(file_type, "_", file_id)
+    data <- load_data(file_id, file_type)
+    if (!is.null(data)) {
+      data_list[[key]] <- data
+      cat(sprintf("Loaded %s: %d rows, %d columns\n", key, nrow(data), ncol(data)))
+    }
+  }
+}
+
+# Examine first few rows of one dataset to verify structure
+head(data_list[["train_FD001"]])
+```
+
+## Data Preparation and RUL Calculation
+
+```{r prepare_train_data}
+# Enhanced function to prepare training data with proper RUL calculation
+prepare_train_data <- function(data, min_cycles = 0) {
+  data <- as_tibble(data)
+  
+  # Calculate RUL based on max cycles for each unit
+  fd_RUL <- data %>%
+    group_by(unit_number) %>%
+    summarize(max_time = max(time_in_cycles), .groups = 'drop')
+  
+  data <- data %>%
+    left_join(fd_RUL, by = "unit_number") %>%
+    mutate(RUL = max_time - time_in_cycles) %>%
+    select(-max_time)
+  
+  # Filter out early cycles if requested
+  if (min_cycles > 0) {
+    data <- data %>% filter(time_in_cycles >= min_cycles)
+  }
+  
+  return(data)
+}
+
+# Function to prepare test data with actual RUL values
+prepare_test_data <- function(test_data, rul_data) {
+  # Get max cycle for each unit in test
+  test_max_cycles <- test_data %>%
+    group_by(unit_number) %>%
+    summarize(max_time = max(time_in_cycles), .groups = 'drop')
+  
+  # Add RUL column from the RUL file 
+  if (!is.null(rul_data)) {
+    # Make sure rul_data has unit_number
+    if (ncol(rul_data) == 1) {
+      # If RUL data only has one column, assume it's the RUL values in order
+      rul_with_unit <- tibble(
+        unit_number = 1:nrow(rul_data),
+        true_RUL = rul_data[[1]]
+      )
+    } else {
+      # Otherwise assume first column is unit and second is RUL
+      rul_with_unit <- tibble(
+        unit_number = rul_data[[1]],
+        true_RUL = rul_data[[2]]
+      )
+    }
+    
+    # Join with test units
+    test_rul <- test_max_cycles %>%
+      left_join(rul_with_unit, by = "unit_number")
+    
+    # Now add RUL to each test record
+    test_data <- test_data %>%
+      left_join(test_rul, by = "unit_number") %>%
+      mutate(RUL = true_RUL - (max_time - time_in_cycles)) %>%
+      select(-true_RUL, -max_time)
+  }
+  
+  return(test_data)
+}
+
+# Apply preparation to all training datasets
+prepared_train_data <- list()
+for (i in 1:length(file_ids)) {
+  file_id <- file_ids[i]
+  train_key <- paste0("train_", file_id)
+  
+  if (train_key %in% names(data_list)) {
+    prepared_train_data[[train_key]] <- prepare_train_data(data_list[[train_key]])
+    cat(sprintf("Prepared %s: %d rows, %d columns\n", 
+               train_key, nrow(prepared_train_data[[train_key]]), 
+               ncol(prepared_train_data[[train_key]])))
+  }
+}
+
+# Prepare test data with RUL values
+prepared_test_data <- list()
+for (i in 1:length(file_ids)) {
+  file_id <- file_ids[i]
+  test_key <- paste0("test_", file_id)
+  rul_key <- paste0("RUL_", file_id)
+  
+  if (test_key %in% names(data_list)) {
+    prepared_test_data[[test_key]] <- prepare_test_data(
+      data_list[[test_key]], 
+      data_list[[rul_key]]
+    )
+    cat(sprintf("Prepared %s: %d rows, %d columns\n", 
+               test_key, nrow(prepared_test_data[[test_key]]), 
+               ncol(prepared_test_data[[test_key]])))
+  }
+}
+```
+
+## Enhanced Exploratory Data Analysis
+
+```{r data_exploration}
+# Load necessary packages
+library(tidyverse)  # This loads dplyr, ggplot2, and other required packages
+
+# Function to identify sensor columns
+get_sensor_columns <- function(data) {
+  # Identify likely sensor columns (based on your data)
+  sensor_patterns <- c("^T", "^P", "^N", "^W", "^phi", "^BPR", "^far", "^ht", "^epr", "^Ps")
+  
+  all_cols <- colnames(data)
+  sensor_cols <- character(0)
+  
+  # Collect all columns matching patterns
+  for (pattern in sensor_patterns) {
+    matched_cols <- all_cols[grepl(pattern, all_cols)]
+    sensor_cols <- c(sensor_cols, matched_cols)
+  }
+  
+  # Deduplicate and remove any non-existent columns
+  sensor_cols <- unique(sensor_cols)
+  sensor_cols <- sensor_cols[sensor_cols %in% all_cols]
+  
+  # Fallback if no columns matched
+  if (length(sensor_cols) == 0) {
+    # Exclude known non-sensor columns
+    non_sensors <- c("unit_number", "time_in_cycles", "RUL", 
+                   "setting_1", "setting_2", "setting_3", "max_time")
+    sensor_cols <- setdiff(all_cols, non_sensors)
+  }
+  
+  return(sensor_cols)
+}
+
+# Analyze sensor distributions and trends
+analyze_dataset <- function(dataset, name) {
+  # Identify sensor columns
+  sensors <- get_sensor_columns(dataset)
+  
+  # Basic statistics
+  cat("\n=== Dataset:", name, "===\n")
+  cat("Units:", length(unique(dataset$unit_number)), "\n")
+  cat("Total records:", nrow(dataset), "\n")
+  
+  # Handle potential missing RUL column gracefully
+  if ("RUL" %in% colnames(dataset)) {
+    cat("RUL range:", min(dataset$RUL, na.rm = TRUE), "to", max(dataset$RUL, na.rm = TRUE), "\n\n")
+    
+    # Plot RUL distribution
+    p1 <- ggplot(dataset, aes(x = RUL)) +
+      geom_histogram(bins = 50, fill = "steelblue", alpha = 0.7) +
+      labs(title = paste("RUL Distribution -", name),
+           x = "Remaining Useful Life (cycles)",
+           y = "Count") +
+      theme_minimal()
+    print(p1)
+  } else {
+    cat("No RUL column found in this dataset\n\n")
+  }
+  
+  # Plot some sensor trends for a sample unit
+  # Use slice_max instead of arrange + slice
+  sample_unit_df <- dataset %>% 
+    group_by(unit_number) %>%
+    summarize(cycles = max(time_in_cycles)) %>%
+    slice_max(order_by = cycles, n = 1)
+  
+  sample_unit <- sample_unit_df$unit_number[1]
+  
+  unit_data <- dataset %>% 
+    filter(unit_number == sample_unit) %>%
+    select(time_in_cycles, any_of("RUL"), all_of(head(sensors, 6)))
+  
+  long_unit_data <- unit_data %>%
+    pivot_longer(cols = -c(time_in_cycles, any_of("RUL")),
+                 names_to = "sensor",
+                 values_to = "value")
+  
+  p2 <- ggplot(long_unit_data, aes(x = time_in_cycles, y = value, color = sensor)) +
+    geom_line() +
+    labs(title = paste("Sensor Readings for Unit", sample_unit),
+         x = "Cycles",
+         y = "Sensor Value") +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
+  print(p2)
+  
+  # Calculate correlation with RUL (if RUL exists)
+  if ("RUL" %in% colnames(dataset)) {
+    sensor_data <- dataset %>% select(all_of(sensors), RUL)
+    cor_with_rul <- sapply(sensor_data %>% select(-RUL), function(x) {
+      cor(x, sensor_data$RUL, use = "pairwise.complete.obs")
+    })
+    
+    cor_df <- data.frame(
+      sensor = names(cor_with_rul),
+      correlation = cor_with_rul
+    ) %>%
+      arrange(desc(abs(correlation)))
+    
+    # Plot top correlations
+    p3 <- ggplot(head(cor_df, 10), 
+                aes(x = reorder(sensor, abs(correlation)), y = correlation)) +
+      geom_bar(stat = "identity", aes(fill = correlation > 0)) +
+      coord_flip() +
+      labs(title = "Top Correlations with RUL",
+           x = "Sensor",
+           y = "Correlation with RUL") +
+      theme_minimal() +
+      scale_fill_discrete(name = "Direction", labels = c("Negative", "Positive"))
+    
+    print(p3)
+    
+    # Return top correlated sensors for later use
+    return(head(cor_df$sensor, 10))
+  } else {
+    cat("Cannot calculate correlations without RUL column\n")
+    return(sensors[1:10])  # Return first 10 sensors as fallback
+  }
+}
+
+# Before analyzing, make sure your prepared_train_data has the RUL column
+# Here's how to prepare your data with RUL values:
+
+prepare_train_data <- function(data_list) {
+  prepared_data <- list()
+  
+  for (i in 1:length(file_ids)) {
+    file_id <- file_ids[i]
+    train_key <- paste0("train_", file_id)
+    
+    # Skip if data is not available
+    if (!train_key %in% names(data_list)) {
+      next
+    }
+    
+    # Get the training data for this file ID
+    train_data <- data_list[[train_key]]
+    
+    # Calculate RUL for each unit
+    train_data_with_rul <- train_data %>%
+      group_by(unit_number) %>%
+      mutate(max_time = max(time_in_cycles),
+             RUL = max_time - time_in_cycles) %>%
+      ungroup()
+    
+    # Store the prepared data
+    prepared_data[[train_key]] <- train_data_with_rul
+  }
+  
+  return(prepared_data)
+}
+
+# Prepare the training data
+prepared_train_data <- prepare_train_data(data_list)
+
+# Get sensor columns for analysis
+if (length(prepared_train_data) > 0) {
+  first_dataset <- prepared_train_data[[1]]
+  sensor_cols <- get_sensor_columns(first_dataset)
+  cat("Identified sensor columns:", paste(sensor_cols, collapse=", "), "\n")
+  
+  # Analyze first dataset in detail
+  top_sensors_fd001 <- analyze_dataset(first_dataset, names(prepared_train_data)[1])
+} else {
+  cat("No prepared data available for analysis\n")
+}
+```
+
+## Improved Feature Engineering
+
+```{r feature_engineering}
+compute_features <- function(dataset, window_sizes = c(5, 10, 20), lags = c(1, 3, 5)) {
+  # Get sensor columns
+  sensor_cols <- get_sensor_columns(dataset)
+  
+  # Process each unit independently for time series integrity
+  result <- dataset %>%
+    group_by(unit_number) %>%
+    arrange(unit_number, time_in_cycles) %>%
+    mutate(
+      # Normalize each sensor by subtracting mean and dividing by std dev
+      across(all_of(sensor_cols), list(
+        norm = ~((.x - mean(.x, na.rm = TRUE)) / (sd(.x, na.rm = TRUE) + 1e-8))
+      ), .names = "{.col}_norm"),
+      
+      # Life percentage (normalized cycle)
+      life_pct = time_in_cycles / max(time_in_cycles),
+      # Time since first observation
+      cycles_since_first = time_in_cycles - min(time_in_cycles)
+    ) %>%
+    ungroup()
+  
+  # For each window size, calculate rolling features
+  for (w in window_sizes) {
+    result <- result %>%
+      group_by(unit_number) %>%
+      arrange(unit_number, time_in_cycles) %>%
+      mutate(
+        # Rolling window features
+        across(all_of(sensor_cols), list(
+          # Rolling mean
+          mean = ~zoo::rollmean(.x, k = w, fill = NA, align = "right"),
+          # Rolling standard deviation - FIXED HERE
+          sd = ~zoo::rollapply(.x, width = w, 
+                             FUN = function(x) sd(x, na.rm = TRUE), 
+                             fill = NA, align = "right"),
+          # Rolling slope (trend)
+          slope = ~zoo::rollapply(.x, width = w, 
+                                FUN = function(x) {
+                                  if (length(unique(x)) <= 1 || all(is.na(x))) return(0)
+                                  tryCatch({
+                                    coef(lm(x ~ seq_along(x)))[2]
+                                  }, error = function(e) 0)
+                                }, 
+                                fill = NA, align = "right")
+        ), .names = "{.col}_w{w}_{.fn}")
+      ) %>%
+      ungroup()
+  }
+  
+  # Add lag features
+  for (lag in lags) {
+    result <- result %>%
+      group_by(unit_number) %>%
+      arrange(unit_number, time_in_cycles) %>%
+      mutate(
+        across(all_of(sensor_cols), list(
+          # Lagged values
+          lag = ~lag(.x, n = lag, default = NA)
+        ), .names = "{.col}_lag{lag}"),
+        
+        # Differences (current - lagged)
+        across(all_of(sensor_cols), list(
+          diff = ~.x - lag(.x, n = lag, default = NA)
+        ), .names = "{.col}_diff{lag}")
+      ) %>%
+      ungroup()
+  }
+  
+  # Calculate moving averages relative to historical values
+  result <- result %>%
+    group_by(unit_number) %>%
+    arrange(unit_number, time_in_cycles) %>%
+    mutate(
+      # For select sensors, calculate ratios to historical means
+      across(all_of(head(sensor_cols, min(10, length(sensor_cols)))), list(
+        ratio_to_init = ~.x / mean(head(.x, 3), na.rm = TRUE)
+      ), .names = "{.col}_ratio")
+    ) %>%
+    ungroup()
+  
+  # Handle any infinite or NaN values
+  result <- result %>%
+    mutate(across(where(is.numeric), ~ifelse(is.infinite(.x) | is.nan(.x), NA, .x)))
+  
+  return(result)
+}
+
+# Apply feature engineering to all datasets
+cat("Engineering features for datasets...\n")
+engineered_train_data <- list()
+for (name in names(prepared_train_data)) {
+  cat("Processing", name, "...\n")
+  engineered_train_data[[name]] <- compute_features(prepared_train_data[[name]])
+  cat("  Created", ncol(engineered_train_data[[name]]), "features\n")
+}
+
+# Apply the same feature engineering to test datasets
+engineered_test_data <- list()
+for (name in names(prepared_test_data)) {
+  cat("Processing", name, "...\n")
+  engineered_test_data[[name]] <- compute_features(prepared_test_data[[name]])
+  cat("  Created", ncol(engineered_test_data[[name]]), "features\n")
+}
+
+# Show a sample of the engineered features
+head(names(engineered_train_data[[1]]), 20)
+```
+
+## Feature Selection and Dimensionality Reduction
+
+```{r feature_selection}
+# Enhanced feature selection function
+select_features <- function(dataset, target_col = "RUL", top_n = 30, 
+                          method = "rf", sample_size = 10000) {
+  # Ensure we work with a tibble
+  dataset <- as_tibble(dataset)
+  
+  # Handle large datasets by sampling
+  if (nrow(dataset) > sample_size) {
+    set.seed(42)
+    dataset <- dataset %>% sample_n(sample_size)
+  }
+  
+  # Exclude non-feature columns
+  exclude_cols <- c("unit_number", "time_in_cycles", target_col)
+  feature_cols <- setdiff(names(dataset), exclude_cols)
+  
+  # Keep only numeric features with variation
+  is_numeric <- sapply(dataset[feature_cols], is.numeric)
+  feature_cols <- feature_cols[is_numeric]
+  
+  # Remove near-zero variance features
+  var_info <- sapply(dataset[feature_cols], function(x) {
+    var(x, na.rm = TRUE)
+  })
+  feature_cols <- feature_cols[var_info > 1e-8]
+  
+  # Remove highly correlated features (optional)
+  if (length(feature_cols) > 100) {
+    cor_matrix <- cor(dataset[feature_cols], use = "pairwise.complete.obs")
+    highly_correlated <- findCorrelation(cor_matrix, cutoff = 0.9)
+    if (length(highly_correlated) > 0) {
+      feature_cols <- feature_cols[-highly_correlated]
+    }
+  }
+  
+  # Prepare data for feature selection
+  X <- dataset %>% 
+    select(all_of(feature_cols)) %>%
+    drop_na()
+  
+  y <- dataset[[target_col]][!is.na(rowSums(as.matrix(X)))]
+  
+  # Skip feature selection if no valid features
+  if (length(feature_cols) == 0 || nrow(X) < 10) {
+    warning("Insufficient valid data for feature selection")
+    return(character(0))
+  }
+  
+  # Feature selection method
+  if (method == "rf") {
+    set.seed(42)
+    
+    tryCatch({
+      # Use random forest for feature importance
+      cat("Running random forest for feature selection...\n")
+      rf_model <- randomForest(x = X, y = y, ntree = 100, importance = TRUE)
+      
+      # Extract importance scores
+      imp <- importance(rf_model)
+      imp_df <- data.frame(
+        Feature = rownames(imp),
+        Importance = imp[, "%IncMSE"]
+      )
+      
+      # Sort by importance
+      imp_df <- imp_df[order(imp_df$Importance, decreasing = TRUE), ]
+      
+      # Select top features
+      top_features <- as.character(head(imp_df$Feature, top_n))
+      
+      return(list(
+        features = top_features,
+        importance = imp_df
+      ))
+    }, error = function(e) {
+      warning("Error in RF feature selection: ", e$message)
+      return(list(
+        features = feature_cols[1:min(top_n, length(feature_cols))],
+        importance = data.frame(Feature = feature_cols, Importance = 1)
+      ))
+    })
+  } else if (method == "correlation") {
+    # Use correlation with target
+    cor_values <- sapply(X, function(x) {
+      abs(cor(x, y, use = "pairwise.complete.obs"))
+    })
+    
+    # Sort by absolute correlation
+    cor_df <- data.frame(
+      Feature = names(cor_values),
+      Importance = cor_values
+    )
+    cor_df <- cor_df[order(cor_df$Importance, decreasing = TRUE), ]
+    
+    # Return top features
+    return(list(
+      features = as.character(head(cor_df$Feature, top_n)),
+      importance = cor_df
+    ))
+  }
+}
+
+# Select features for each dataset
+selected_features <- list()
+feature_importance <- list()
+
+for (ds_name in names(engineered_train_data)) {
+  cat("Selecting features for", ds_name, "...\n")
+  result <- select_features(engineered_train_data[[ds_name]], top_n = 30)
+  
+  selected_features[[ds_name]] <- result$features
+  feature_importance[[ds_name]] <- result$importance
+  
+  cat("  Selected", length(selected_features[[ds_name]]), "features\n")
+  cat("  Top 5:", paste(head(selected_features[[ds_name]], 5), collapse=", "), "\n")
+  
+  # Visualize feature importance
+  ggplot(head(feature_importance[[ds_name]], 15), 
+        aes(x = reorder(Feature, Importance), y = Importance)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    coord_flip() +
+    labs(title = paste("Top Features -", ds_name),
+         x = "Feature",
+         y = "Importance") +
+    theme_minimal()
+}
+```
+
+## Model Training and Evaluation Framework
+
+```{r model_framework}
+# Prepare data for modeling
+prepare_model_data <- function(dataset, features, id_vars = c("unit_number", "time_in_cycles", "RUL")) {
+  # Make sure features are in the dataset
+  features <- features[features %in% colnames(dataset)]
+  
+  # If no features, return NULL
+  if (length(features) == 0) {
+    warning("No valid features provided")
+    return(NULL)
+  }
+  
+  # Prepare data with features and targets
+  model_data <- dataset %>%
+    select(all_of(c(id_vars, features))) %>%
+    drop_na()
+  
+  return(model_data)
+}
+
+# Split data by units to avoid data leakage
+split_by_units <- function(data, train_pct = 0.7) {
+  units <- unique(data$unit_number)
+  n_units <- length(units)
+  
+  # Shuffle and split
+  set.seed(42)
+  train_units <- sample(units, size = floor(train_pct * n_units))
+  
+  # Create training and validation sets
+  train_data <- data %>% filter(unit_number %in% train_units)
+  val_data <- data %>% filter(!(unit_number %in% train_units))
+  
+  return(list(
+    train = train_data,
+    validation = val_data
+  ))
+}
+
+# Custom RMSE scoring function
+rmse_score <- function(actual, predicted) {
+  sqrt(mean((actual - predicted)^2))
+}
+
+# Custom RMSE-based assessment for CMAPSS data
+custom_rmse <- function(actual, predicted) {
+  d <- actual - predicted
+  
+  # Penalizing early predictions more than late predictions
+  score <- ifelse(d >= 0, 
+                exp(d/13) - 1,    # Late prediction: exp(d/13) - 1
+                exp(-d/10) - 1)   # Early prediction: exp(-d/10) - 1
+  
+  return(mean(score))
+}
+
+# Enhanced model evaluation function
+evaluate_model <- function(model, X_test, y_test, model_type) {
+  # Make predictions
+  if (model_type == "rf") {
+    y_pred <- predict(model, X_test)
+  } else if (model_type == "xgb") {
+    y_pred <- predict(model, as.matrix(X_test))
+  } else if (model_type == "gbm") {
+    y_pred <- predict(model, as.data.frame(X_test), n.trees = model$n.trees)
+  } else if (model_type == "elastic_net") {
+    y_pred <- predict(model, as.matrix(X_test), s = "lambda.min")[,1]
+  } else if (model_type == "lightgbm") {
+    y_pred <- predict(model, as.matrix(X_test))
+  } else {
+    stop("Unknown model type: ", model_type)
+  }
+  
+  # Calculate metrics
+  metrics <- list(
+    RMSE = rmse_score(y_test, y_pred),
+    MAE = mean(abs(y_test - y_pred)),
+    CMAPSS_Score = custom_rmse(y_test, y_pred),
+    R2 = 1 - sum((y_test - y_pred)^2) / sum((y_test - mean(y_test))^2)
+  )
+  
+  return(list(
+    metrics = metrics,
+    predictions = y_pred
+  ))
+}
+```
+
+```{r}
+extract_frequency_features <- function(dataset, sensor_cols) {
+  result <- dataset %>%
+    group_by(unit_number) %>%
+    arrange(time_in_cycles) %>%
+    do({
+      unit_data <- .
+      
+      # Apply FFT to each sensor
+      fft_features <- lapply(sensor_cols, function(col) {
+        # Get the sensor data
+        signal <- unit_data[[col]]
+        
+        # Apply FFT
+        fft_result <- fft(signal)
+        
+        # Extract magnitude
+        magnitude <- Mod(fft_result)[1:(length(fft_result)/2)]
+        
+        # Get dominant frequencies
+        sorted_mag <- sort(magnitude, decreasing = TRUE)
+        top_5_freq <- sorted_mag[1:min(5, length(sorted_mag))]
+        
+        # Calculate summary statistics of the frequency spectrum
+        data.frame(
+          mean_magnitude = mean(magnitude),
+          max_magnitude = max(magnitude),
+          sum_top5_magnitude = sum(top_5_freq),
+          spectral_kurtosis = kurtosis(magnitude),
+          spectral_entropy = -sum(magnitude * log(magnitude + 1e-10)) / log(length(magnitude))
+        )
+      })
+      
+      # Combine all features into a single data frame
+      fft_df <- do.call(cbind, fft_features)
+      colnames(fft_df) <- paste0(rep(sensor_cols, each = 5), 
+                                "_fft_", 
+                                c("mean", "max", "top5sum", "kurtosis", "entropy"))
+      
+      # Add the original unit data
+      cbind(unit_data, fft_df)
+    }) %>%
+    ungroup()
+  
+  return(result)
+}
+```
+
+```{r}
+extract_wavelet_features <- function(dataset, sensor_cols, wavelet = "haar", level = 3) {
+  result <- dataset %>%
+    group_by(unit_number) %>%
+    arrange(time_in_cycles) %>%
+    do({
+      unit_data <- .
+      
+      # Apply wavelet transform to each sensor
+      wavelet_features <- lapply(sensor_cols, function(col) {
+        # Get the sensor data
+        signal <- unit_data[[col]]
+        
+        # Ensure signal length is sufficient (power of 2 ideally)
+        n <- length(signal)
+        padded_length <- 2^ceiling(log2(n))
+        padded_signal <- c(signal, rep(signal[n], padded_length - n))
+        
+        # Apply wavelet transform
+        wt <- dwt(padded_signal, wf = wavelet, n.levels = level)
+        
+        # Extract features from each level
+        wavelet_stats <- sapply(1:level, function(l) {
+          coeffs <- accessD(wt, level = l)
+          c(mean(abs(coeffs)), sd(coeffs), 
+            quantile(coeffs, probs = c(0.25, 0.75)),
+            sum(coeffs^2))
+        })
+        
+        # Reshape into a data frame
+        wavelet_df <- as.data.frame(t(wavelet_stats))
+        colnames(wavelet_df) <- c("mean", "sd", "q25", "q75", "energy")
+        
+        # Create column names with sensor and level
+        result_df <- data.frame(matrix(as.numeric(t(wavelet_df)), nrow = 1))
+        colnames(result_df) <- paste0(col, "_wavelet_L", rep(1:level, each = 5), 
+                                    "_", rep(c("mean", "sd", "q25", "q75", "energy"), level))
+        return(result_df)
+      })
+      
+      # Combine all features
+      wavelet_df <- do.call(cbind, wavelet_features)
+      
+      # Add the original unit data
+      cbind(unit_data, wavelet_df)
+    }) %>%
+    ungroup()
+  
+  return(result)
+}
+```
+
+```{r}
+create_health_indicators <- function(dataset, sensor_cols, n_components = 3) {
+  # Extract only sensor data for PCA
+  sensor_data <- dataset %>% select(all_of(sensor_cols))
+  
+  # Scale the data
+  scaled_data <- scale(sensor_data)
+  
+  # Apply PCA
+  pca_result <- prcomp(scaled_data, center = TRUE, scale. = TRUE)
+  
+  # Extract the top components
+  components <- pca_result$x[, 1:n_components]
+  
+  # Create health indicators
+  health_indicators <- as.data.frame(components)
+  colnames(health_indicators) <- paste0("health_indicator_", 1:n_components)
+  
+  # Add health score - weighted sum of components
+  explained_var <- pca_result$sdev^2 / sum(pca_result$sdev^2)
+  weights <- explained_var[1:n_components] / sum(explained_var[1:n_components])
+  
+  # Calculate health score (higher value means worse health)
+  health_score <- as.matrix(health_indicators) %*% weights
+  
+  # Add health indicators to the original dataset
+  result <- cbind(dataset, health_indicators, health_score = health_score)
+  
+  return(list(
+    data = result,
+    pca_model = pca_result,
+    explained_variance = explained_var[1:n_components]
+  ))
+}
+```
+
+```{r}
+enhanced_feature_engineering <- function(dataset, sensor_cols) {
+  # Original features
+  cat("Creating standard time-domain features...\n")
+  result <- compute_features(dataset)
+  
+  # Extract frequency-domain features
+  cat("Adding frequency domain features...\n")
+  result <- extract_frequency_features(result, sensor_cols)
+  
+  # Extract wavelet features
+  cat("Adding wavelet transform features...\n")
+  result <- extract_wavelet_features(result, sensor_cols)
+  
+  # Create health indicators
+  cat("Creating health indicators using PCA...\n")
+  hi_result <- create_health_indicators(result, sensor_cols)
+  result <- hi_result$data
+  
+  # Log the overall process
+  cat("Total features created:", ncol(result), "\n")
+  cat("PCA explained variance:", paste(round(hi_result$explained_variance * 100, 2), "% ", sep=""), "\n")
+  
+  return(list(
+    data = result,
+    pca_model = hi_result$pca_model
+  ))
+}
+```
+
+```{r}
+prepare_sequence_data <- function(data, features, sequence_length = -1, stride = 1) {
+  # If sequence_length is -1, use all available time steps for each unit
+  data <- as_tibble(data)
+  
+  # Determine the features to use
+  feature_cols <- features[features %in% colnames(data)]
+  
+  # Prepare sequences by unit
+  sequences <- list()
+  labels <- list()
+  unit_ids <- list()
+  
+  # Process each unit
+  for (unit in unique(data$unit_number)) {
+    # Get data for this unit
+    unit_data <- data %>% 
+      filter(unit_number == unit) %>%
+      arrange(time_in_cycles)
+    
+    # Extract features and target
+    X_unit <- as.matrix(unit_data[, feature_cols])
+    y_unit <- as.vector(unit_data$RUL)
+    
+    # Determine sequence length
+    seq_len <- if (sequence_length <= 0) nrow(unit_data) else sequence_length
+    
+    # Create sequences
+    for (i in seq(1, nrow(unit_data) - seq_len + 1, by = stride)) {
+      end_idx <- i + seq_len - 1
+      if (end_idx <= nrow(unit_data)) {
+        sequences[[length(sequences) + 1]] <- X_unit[i:end_idx, ]
+        labels[[length(labels) + 1]] <- y_unit[end_idx]
+        unit_ids[[length(unit_ids) + 1]] <- unit
+      }
+    }
+  }
+  
+  # Convert to arrays for Keras
+  X <- array(0, dim = c(length(sequences), seq_len, length(feature_cols)))
+  y <- numeric(length(sequences))
+  units <- numeric(length(sequences))
+  
+  for (i in 1:length(sequences)) {
+    X[i, , ] <- sequences[[i]]
+    y[i] <- labels[[i]]
+    units[i] <- unit_ids[[i]]
+  }
+  
+  return(list(
+    X = X,
+    y = y,
+    units = units,
+    feature_names = feature_cols
+  ))
+}
+```
+
+```{r}
+build_lstm_model <- function(input_shape, dropout_rate = 0.2) {
+  # Initialize keras
+  library(keras)
+  
+  # Create sequential model
+  model <- keras_model_sequential() %>%
+    layer_lstm(units = 64, return_sequences = TRUE, input_shape = input_shape) %>%
+    layer_dropout(rate = dropout_rate) %>%
+    layer_lstm(units = 32, return_sequences = FALSE) %>%
+    layer_dropout(rate = dropout_rate) %>%
+    layer_dense(units = 16, activation = 'relu') %>%
+    layer_dense(units = 1, activation = 'linear')
+  
+  # Compile model
+  model %>% compile(
+    loss = 'mean_squared_error',
+    optimizer = optimizer_adam(learning_rate = 0.001),
+    metrics = c('mae')
+  )
+  
+  return(model)
+}
+```
+
+```{r}
+train_lstm_model <- function(X_train, y_train, X_val, y_val, 
+                           batch_size = 32, epochs = 100) {
+  # Create callbacks
+  callbacks <- list(
+    callback_early_stopping(monitor = "val_loss", patience = 10, restore_best_weights = TRUE),
+    callback_reduce_lr_on_plateau(monitor = "val_loss", factor = 0.5, patience = 5)
+  )
+  
+  # Train model
+  history <- fit(
+    lstm_model,
+    x = X_train,
+    y = y_train,
+    batch_size = batch_size,
+    epochs = epochs,
+    validation_data = list(X_val, y_val),
+    callbacks = callbacks,
+    verbose = 1
+  )
+  
+  return(history)
+}
+```
+
+```{r}
+prepare_survival_data <- function(data) {
+  # Create event indicator (1 = failure occurred, 0 = censored)
+  surv_data <- data %>%
+    group_by(unit_number) %>%
+    mutate(
+      # Last observation for each unit is the failure point
+      is_failure = time_in_cycles == max(time_in_cycles),
+      # Event indicator (1 for failure, 0 for censored)
+      event = as.numeric(is_failure),
+      # Time to event is the RUL
+      time = RUL
+    ) %>%
+    ungroup()
+  
+  return(surv_data)
+}
+```
+
+```{r}
+train_survival_forest <- function(data, features, n_trees = 100) {
+  library(randomForestSRC)
+  
+  # Prepare formula
+  formula_str <- paste("Surv(time, event) ~", paste(features, collapse = " + "))
+  formula_obj <- as.formula(formula_str)
+  
+  # Train model
+  rsf_model <- rfsrc(
+    formula = formula_obj,
+    data = data,
+    ntree = n_trees,
+    importance = TRUE
+  )
+  
+  return(rsf_model)
+}
+
+# Accelerated Failure Time model
+train_aft_model <- function(data, features) {
+  library(survival)
+  
+  # Prepare formula
+  formula_str <- paste("Surv(time, event) ~", paste(features, collapse = " + "))
+  formula_obj <- as.formula(formula_str)
+  
+  # Train Weibull AFT model
+  aft_model <- survreg(
+    formula = formula_obj,
+    data = data,
+    dist = "weibull"
+  )
+  
+  return(aft_model)
+}
+```
+
+```{r}
+predict_rul_with_intervals <- function(model, newdata, alpha = 0.05) {
+  if (class(model)[1] == "rfsrc") {
+    # Prediction for Random Survival Forest
+    preds <- predict(model, newdata = newdata)
+    
+    # Extract predicted survival function
+    surv_curves <- preds$survival
+    times <- model$time.interest
+    
+    # Calculate median survival time (RUL prediction)
+    median_rul <- sapply(1:nrow(surv_curves), function(i) {
+      curve <- surv_curves[i,]
+      # Find time where survival probability crosses 0.5
+      idx <- which(curve <= 0.5)[1]
+      if (is.na(idx)) {
+        # If no crossing, use max time
+        return(max(times))
+      } else {
+        return(times[idx])
+      }
+    })
+    
+    # Calculate prediction intervals
+    lower_rul <- sapply(1:nrow(surv_curves), function(i) {
+      curve <- surv_curves[i,]
+      idx <- which(curve <= (1-alpha/2))[1]
+      if (is.na(idx)) return(max(times)) else return(times[idx])
+    })
+    
+    upper_rul <- sapply(1:nrow(surv_curves), function(i) {
+      curve <- surv_curves[i,]
+      idx <- which(curve <= (alpha/2))[1]
+      if (is.na(idx)) return(max(times)) else return(times[idx])
+    })
+    
+  } else if (class(model)[1] == "survreg") {
+    # Prediction for AFT model
+    preds <- predict(model, newdata = newdata, type = "quantile", 
+                    p = c(alpha/2, 0.5, 1-alpha/2))
+    
+    # Extract predictions and intervals
+    lower_rul <- preds[,1]
+    median_rul <- preds[,2]
+    upper_rul <- preds[,3]
+  } else {
+    stop("Unsupported model type")
+  }
+  
+  return(data.frame(
+    RUL = median_rul,
+    lower = lower_rul,
+    upper = upper_rul
+  ))
+}
+
+```
+
+```{r}
+train_stacked_ensemble <- function(train_data, features, target = "RUL") {
+  # Initialize H2O
+  h2o.init()
+  
+  # Convert data to H2O frames
+  h2o_train <- as.h2o(train_data)
+  
+  # Define features and target
+  x <- features
+  y <- target
+  
+  # Train base models
+  cat("Training base models for ensemble...\n")
+  
+  # Random Forest
+  rf_model <- h2o.randomForest(
+    x = x,
+    y = y,
+    training_frame = h2o_train,
+    ntrees = 100,
+    max_depth = 20,
+    seed = 42
+  )
+  
+  # Gradient Boosting Machine
+  gbm_model <- h2o.gbm(
+    x = x,
+    y = y,
+    training_frame = h2o_train,
+    ntrees = 100,
+    max_depth = 10,
+    learn_rate = 0.05,
+    seed = 42
+  )
+  
+  # XGBoost
+  xgb_model <- h2o.xgboost(
+    x = x,
+    y = y,
+    training_frame = h2o_train,
+    ntrees = 100,
+    max_depth = 10,
+    learn_rate = 0.05,
+    seed = 42
+  )
+  
+  # Deep Learning
+  dl_model <- h2o.deeplearning(
+    x = x,
+    y = y,
+    training_frame = h2o_train,
+    hidden = c(64, 32, 16),
+    epochs = 50,
+    seed = 42
+  )
+  
+  # Train a stacked ensemble
+  cat("Training stacked ensemble...\n")
+  ensemble <- h2o.stackedEnsemble(
+    x = x,
+    y = y,
+    training_frame = h2o_train,
+    base_models = list(rf_model, gbm_model, xgb_model, dl_model)
+  )
+  
+  # Return all models
+  return(list(
+    ensemble = ensemble,
+    base_models = list(
+      rf = rf_model,
+      gbm = gbm_model,
+      xgb = xgb_model,
+      dl = dl_model
+    )
+  ))
+}
+```
+
+```{r}
+weighted_ensemble_predict <- function(models, weights, X_test) {
+  # Get predictions from each model
+  predictions <- lapply(1:length(models), function(i) {
+    model <- models[[i]]
+    model_type <- names(models)[i]
+    
+    if (model_type == "rf") {
+      return(predict(model, X_test))
+    } else if (model_type == "xgb") {
+      return(predict(model, as.matrix(X_test)))
+    } else if (model_type == "gbm") {
+      return(predict(model, as.data.frame(X_test), n.trees = model$n.trees))
+    } else if (model_type == "lstm") {
+      return(as.vector(predict(model, X_test)))
+    } else {
+      stop("Unsupported model type:", model_type)
+    }
+  })
+  
+  # Weight predictions
+  weighted_preds <- matrix(0, nrow = nrow(X_test), ncol = 1)
+  for (i in 1:length(predictions)) {
+    weighted_preds <- weighted_preds + weights[i] * predictions[[i]]
+  }
+  
+  return(weighted_preds)
+}
+```
+
+```{r}
+# SHAP values for feature importance
+calculate_shap_values <- function(model, X, model_type) {
+  library(shapviz)
+  
+  if (model_type == "xgb") {
+    # For XGBoost models
+    shap <- shapviz(model, X_pred = as.matrix(X))
+  } else if (model_type == "rf") {
+    # For Random Forest models
+    pred <- predict(model, X, nodes = TRUE)
+    shap <- shapviz(model, X_pred = X, pred_fun = function(m, X) predict(m, X))
+  } else {
+    stop("Unsupported model type for SHAP calculation")
+  }
+  
+  return(shap)
+}
+
+# Plot SHAP values
+plot_shap_summary <- function(shap_values) {
+  sv_importance(shap_values)
+}
+
+```
+
+```{r}
+# LIME explanation for individual predictions
+explain_prediction_with_lime <- function(model, X_train, X_test, model_type, instance_idx = 1) {
+  library(lime)
+  
+  # Create LIME explainer
+  if (model_type == "rf") {
+    explainer <- lime(X_train, model, n_bins = 10)
+    explanation <- explain(X_test[instance_idx, , drop = FALSE], explainer, n_features = 10)
+  } else if (model_type == "xgb") {
+    explainer <- lime(as.data.frame(X_train), model, n_bins = 10)
+    explanation <- explain(as.data.frame(X_test[instance_idx, , drop = FALSE]), 
+                          explainer, n_features = 10)
+  } else {
+    stop("Unsupported model type for LIME explanation")
+  }
+  
+  return(explanation)
+}
+
+# Plot LIME explanation
+plot_lime_explanation <- function(explanation) {
+  plot_features(explanation)
+}
+```
+
+```{r}
+# Feature importance across degradation phases
+analyze_degradation_phases <- function(data, model, features, model_type, 
+                                     phase_breaks = c(0.7, 0.3)) {
+  # Define degradation phases based on RUL
+  data$phase <- cut(data$RUL / max(data$RUL, na.rm = TRUE),
+                  breaks = c(0, phase_breaks, 1),
+                  labels = c("End-of-life", "Mid-life", "Early-life"),
+                  include.lowest = TRUE)
+  
+  # Analyze feature importance for each phase
+  phase_importance <- list()
+  
+  for (ph in levels(data$phase)) {
+    phase_data <- data %>% filter(phase == ph)
+    
+    # Skip if not enough data
+    if (nrow(phase_data) < 20) next
+    
+    # Calculate feature importance based on model type
+    if (model_type == "rf") {
+      # For random forest - retrain on this phase
+      rf_phase <- randomForest(
+        x = phase_data[, features],
+        y = phase_data$RUL,
+        ntree = 50,
+        importance = TRUE
+      )
+      importance <- importance(rf_phase)[, "%IncMSE"]
+      names(importance) <- features
+      
+    } else if (model_type == "xgb") {
+      # For XGBoost - calculate SHAP values for this phase
+      shap <- calculate_shap_values(
+        model, 
+        as.matrix(phase_data[, features]), 
+        "xgb"
+      )
+      importance <- sv_importance(shap, kind = "beeswarm", 
+                                plot = FALSE, return_values = TRUE)
+      importance <- setNames(importance$mean_abs_shap, importance$feature)
+    }
+    
+    phase_importance[[ph]] <- importance
+  }
+  
+  # Combine into a single data frame
+  importance_df <- do.call(cbind, phase_importance)
+  colnames(importance_df) <- names(phase_importance)
+  importance_df <- as.data.frame(importance_df)
+  importance_df$feature <- rownames(importance_df)
+  
+  # Reshape for plotting
+  importance_long <- importance_df %>%
+    pivot_longer(cols = -feature, names_to = "phase", values_to = "importance")
+  
+  # Plot
+  p <- ggplot(importance_long, aes(x = reorder(feature, importance), 
+                                  y = importance, fill = phase)) +
+    geom_bar(stat = "identity", position = "dodge") +
+    coord_flip() +
+    labs(title = "Feature Importance Across Degradation Phases",
+         x = "Feature",
+         y = "Importance") +
+    theme_minimal()
+  
+  return(list(
+    plot = p,
+    data = importance_long,
+    raw_importance = phase_importance
+  ))
+}
+
+```
+
+```{r}
+# Function to update models with new data (online learning)
+update_model_online <- function(model, new_data, features, target = "RUL", model_type) {
+  if (model_type == "rf") {
+    # For Random Forest - retrain with combined data
+    updated_model <- randomForest(
+      x = new_data[, features],
+      y = new_data[[target]],
+      ntree = 100,
+      mtry = sqrt(length(features)),
+      importance = TRUE
+    )
+    return(updated_model)
+    
+  } else if (model_type == "xgb") {
+    # For XGBoost - update existing model
+    dtrain <- xgb.DMatrix(
+      data = as.matrix(new_data[, features]),
+      label = new_data[[target]]
+    )
+    
+    # Update with 5 more iterations
+    updated_model <- xgb.train(
+      params = list(
+        objective = "reg:squarederror",
+        eta = 0.03
+      ),
+      data = dtrain,
+      nrounds = 5,
+      xgb_model = model  # Use existing model as starting point
+    )
+    return(updated_model)
+  } else {
+    stop("Unsupported model type for online update")
+  }
+}
+```
+
+```{r}
+# Assumes FD001-FD004 represent different operating conditions
+transfer_learning <- function(source_data, target_data, features, source_model, model_type) {
+  # Extract features from source and target
+  X_source <- source_data[, features]
+  y_source <- source_data$RUL
+  
+  X_target <- target_data[, features]
+  y_target <- target_data$RUL
+  
+  if (model_type == "xgb") {
+    # For XGBoost - use source model as base, fine-tune on target
+    dtrain <- xgb.DMatrix(data = as.matrix(X_target), label = y_target)
+    
+    # Fine-tune with a smaller learning rate
+    xgb_transfer <- xgb.train(
+      params = list(
+        objective = "reg:squarederror",
+        eta = 0.01,  # Smaller learning rate for fine-tuning
+        max_depth = 6
+      ),
+      data = dtrain,
+      nrounds = 50,
+      xgb_model = source_model  # Use source model as starting point
+    )
+    return(xgb_transfer)
+    
+  } else if (model_type == "rf") {
+    # For RF - use source importance to guide feature selection for target
+    importance <- importance(source_model)[, "%IncMSE"]
+    top_features <- names(sort(importance, decreasing = TRUE)[1:min(15, length(importance))])
+    
+    # Train on target with selected features
+    rf_transfer <- randomForest(
+      x = X_target[, intersect(top_features, colnames(X_target))],
+      y = y_target,
+      ntree = 100,
+      importance = TRUE
+    )
+    return(rf_transfer)
+  } else {
+    stop("Unsupported model type for transfer learning")
+  }
+}
+
+```
+
+```{r}
+# Enhanced evaluation metrics
+evaluate_rul_prediction <- function(actual, predicted, predicted_intervals = NULL) {
+  # Basic metrics
+  rmse <- sqrt(mean((actual - predicted)^2))
+  mae <- mean(abs(actual - predicted))
+  
+  # NASA CMAPSS score
+  d <- actual - predicted
+  score <- ifelse(d >= 0, 
+                exp(d/13) - 1,    # Late prediction (underestimation)
+                exp(-d/10) - 1)   # Early prediction (overestimation)
+  cmapss_score <- mean(score)
+  
+  # Additional metrics
+  mape <- mean(abs((actual - predicted) / actual)) * 100
+  
+  # Calculate coverage if intervals are provided
+  coverage <- NA
+  mean_interval_width <- NA
+  
+  if (!is.null(predicted_intervals)) {
+    in_interval <- predicted_intervals$lower <= actual & 
+                   actual <= predicted_intervals$upper
+    coverage <- mean(in_interval)
+    mean_interval_width <- mean(predicted_intervals$upper - predicted_intervals$lower)
+  }
+  
+  # Return metrics
+  metrics <- list(
+    RMSE = rmse,
+    MAE = mae,
+    MAPE = mape,
+    CMAPSS_Score = cmapss_score,
+    Coverage = coverage,
+    Mean_Interval_Width = mean_interval_width
+  )
+  
+  return(metrics)
+}
+```
+
+```{r}
+# Compare sensor trends across multiple units
+plot_degradation <- function(data, sensors, n_units=3) {
+  sample_units <- data %>% 
+    group_by(unit_number) %>% 
+    filter(max(time_in_cycles) > quantile(data$time_in_cycles, 0.9)) %>% 
+    slice_sample(n=n_units) %>% 
+    pull(unit_number) %>% unique()
+
+  data %>%
+    filter(unit_number %in% sample_units) %>%
+    pivot_longer(cols = all_of(sensors), names_to = "sensor") %>%
+    ggplot(aes(x=time_in_cycles, y=value, color=as.factor(unit_number))) +
+    geom_line(alpha=0.8) +
+    facet_wrap(~sensor, scales="free_y", ncol=2) +
+    labs(title="Sensor Degradation Paths Across Units",
+         x="Time in Cycles", 
+         y="Sensor Value",
+         color="Unit Number") +
+    theme_minimal() +
+    theme(legend.position="bottom")
+}
+
+# Usage: plot_degradation(prepared_train_data$train_FD001, top_sensors_fd001)
+
+```
+
+```{r}
+# Kaplan-Meier survival curves
+library(survminer)
+
+plot_survival_curves <- function(data) {
+  fit <- survfit(Surv(RUL) ~ 1, data=data)
+  ggsurvplot(fit, data=data, risk.table=TRUE,
+             title="Kaplan-Meier Survival Curve",
+             xlab="Remaining Useful Life (Cycles)",
+             ylab="Survival Probability",
+             palette="#E7B800", 
+             ggtheme=theme_minimal())
+}
+
+# Add to EDA section
+
+```
+
+```{r}
+# Model-agnostic feature importance
+plot_feature_importance <- function(model, test_data, top_n=15) {
+  imp <- varImp(model)$importance
+  imp$Feature <- rownames(imp)
+  
+  imp %>%
+    arrange(desc(Overall)) %>%
+    head(top_n) %>%
+    ggplot(aes(x=reorder(Feature, Overall), y=Overall)) +
+    geom_col(fill="steelblue", alpha=0.8) +
+    coord_flip() +
+    labs(title="Feature Importance Ranking",
+         x="Features",
+         y="Importance Score") +
+    theme_minimal()
+}
+
+# Use after model training
+
+```
+
+```{r}
+# Explain individual predictions
+plot_shap_analysis <- function(model, sample_data) {
+  explainer <- shapviz(model, X_pred = data.matrix(sample_data))
+  sv_importance(explainer, kind="beehive", max_display=10) +
+    labs(title="SHAP Feature Importance",
+         x="Mean |SHAP Value|") +
+    theme(axis.text.y = element_text(size=9))
+  
+  sv_dependence(explainer, v="T50", color_var="auto") +
+    labs(title="SHAP Dependence Plot for T50")
+}
+
+# Requires trained model and sample data
+
+```
+
+```{r}
+# Model diagnostic plots
+plot_residual_analysis <- function(predictions, actuals) {
+  residuals <- actuals - predictions
+  p1 <- ggplot() + 
+    geom_histogram(aes(residuals), bins=30, fill="steelblue") +
+    labs(title="Residual Distribution", x="Residuals")
+  
+  p2 <- ggplot() +
+    geom_point(aes(x=predictions, y=residuals), alpha=0.5) +
+    geom_hline(yintercept=0, color="red") +
+    labs(title="Residuals vs Predictions", x="Predicted RUL", y="Residuals")
+  
+  p1 + p2 + plot_layout(ncol=2)
+}
+
+# Use after model predictions
+
+```
+
+```{r}
+library(plotly)
+plot_3d_trajectory <- function(unit_data) {
+  plot_ly(unit_data, x=~T50, y=~P15, z=~Nf, 
+          color=~RUL, type="scatter3d", mode="lines",
+          line=list(width=4, colorscale="Viridis")) %>%
+    layout(scene=list(xaxis=list(title="T50"),
+                      yaxis=list(title="P15"),
+                      zaxis=list(title="Nf")),
+           title="3D Sensor Trajectory with RUL Coloring")
+}
+
+# For R Markdown output, include:
+# htmltools::tagList(plot_3d_trajectory(sample_unit_data))
+
+```
+
+```{r}
+# Combined operational view
+plot_operational_status <- function(unit_data) {
+  p1 <- ggplot(unit_data, aes(x=time_in_cycles, y=RUL)) +
+    geom_line(color="darkred") +
+    geom_hline(yintercept=30, linetype="dashed") +
+    annotate("text", x=mean(unit_data$time_in_cycles), y=35, 
+             label="Warning Threshold", color="darkred") +
+    labs(title="RUL Projection", x="Cycles", y="Remaining Life")
+  
+  p2 <- unit_data %>%
+    select(time_in_cycles, T50, P15, Nf) %>%
+    pivot_longer(-time_in_cycles) %>%
+    ggplot(aes(x=time_in_cycles, y=value)) +
+    geom_line(color="steelblue") +
+    facet_wrap(~name, scales="free_y", ncol=1) +
+    labs(x="Cycles", y="Sensor Value")
+  
+  p1 / p2 + plot_layout(heights=c(1,2))
+}
+
+```
+
+```{r}
+# Enhanced visualization of results
+visualize_rul_prediction <- function(actual, predicted, predicted_intervals = NULL, unit_ids = NULL) {
+  # Create data frame for plotting
+  results_df <- data.frame(
+    Actual = actual,
+    Predicted = predicted
+  )
+  
+  if (!is.null(unit_ids)) {
+    results_df$Unit <- unit_ids
+  } else {
+    results_df$Unit <- 1:nrow(results_df)
+  }
+  
+  if (!is.null(predicted_intervals)) {
+    results_df$Lower <- predicted_intervals$lower
+    results_df$Upper <- predicted_intervals$upper
+  }
+  
+  # Predictions vs Actual
+  p1 <- ggplot(results_df, aes(x = Actual, y = Predicted)) +
+    geom_point(alpha = 0.6) +
+    geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+    labs(title = "Predicted vs Actual RUL",
+         x = "Actual RUL",
+         y = "Predicted RUL") +
+    theme_minimal()
+  
+  # Error distribution
+  results_df$Error <- results_df$Predicted - results_df$Actual
+  
+  p2 <- ggplot(results_df, aes(x = Error)) +
+    geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7) +
+    geom_vline(xintercept = 0, color = "red", linetype = "dashed") +
+    labs(title = "Prediction Error Distribution",
+         x = "Prediction Error (Predicted - Actual)",
+         y = "Count") +
+    theme_minimal()
+  
+  # Optional: Include prediction intervals if provided
+  if (!is.null(predicted_intervals)) {
+    p1 <- p1 +
+      geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0.2, alpha = 0.4, color = "darkgray")
+  }
+
+  # Combine the plots
+  if ("patchwork" %in% .packages()) {
+    return(p1 + p2)
+  } else if ("gridExtra" %in% .packages()) {
+    gridExtra::grid.arrange(p1, p2, ncol = 2)
+  } else {
+    print("Install 'patchwork' or 'gridExtra' for plot combining.")
+    return(list(p1, p2))
+  }
+}
+
+```
+
+```{r}
+# Correlation heatmap for sensor columns
+sensor_cols <- get_sensor_columns(first_dataset)
+corr_matrix <- cor(first_dataset %>% select(all_of(sensor_cols)), use = "pairwise.complete.obs")
+corrplot::corrplot(corr_matrix, method = "color", type = "lower", tl.cex=0.7)
+
+```
+
+```{r}
+# Example: Boxplot of a rolling mean feature vs. RUL bins
+first_eng <- engineered_train_data[[1]]
+first_eng <- first_eng %>% mutate(RUL_bin = cut(RUL, breaks=5))
+ggplot(first_eng, aes(x=RUL_bin, y=T24_w5_mean)) +
+  geom_boxplot(fill="skyblue") +
+  labs(title="Rolling Mean of T24 vs. RUL Bin", x="RUL Bin", y="T24 (5-cycle mean)")
+
+```
+
+```{r}
+library(caret)
+set.seed(123)
+# Prepare data (using FD001 as example)
+train_df <- engineered_train_data[[1]] %>%
+  drop_na() %>%
+  select(-unit_number, -time_in_cycles) # Remove non-features
+
+# Split into train/test for demonstration
+idx <- sample(seq_len(nrow(train_df)), size = 0.8*nrow(train_df))
+train_set <- train_df[idx, ]
+test_set <- train_df[-idx, ]
+
+# Train Random Forest
+rf_model <- randomForest(RUL ~ ., data = train_set, ntree=100, importance=TRUE)
+rf_pred <- predict(rf_model, test_set)
+rf_rmse <- sqrt(mean((rf_pred - test_set$RUL)^2))
+cat("Random Forest RMSE:", rf_rmse, "\n")
+
+```
+
+```{r}
+varImpPlot(rf_model, main="Random Forest Feature Importance")
+```
+
+```{r}
+library(xgboost)
+# Prepare matrices
+X_train <- as.matrix(train_set %>% select(-RUL))
+y_train <- train_set$RUL
+X_test <- as.matrix(test_set %>% select(-RUL))
+y_test <- test_set$RUL
+
+xgb_model <- xgboost(data = X_train, label = y_train, nrounds = 100, objective = "reg:squarederror", verbose=0)
+xgb_pred <- predict(xgb_model, X_test)
+xgb_rmse <- sqrt(mean((xgb_pred - y_test)^2))
+cat("XGBoost RMSE:", xgb_rmse, "\n")
+
+```
+
+```{r}
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(keras)
+library(tensorflow)
+library(dplyr)
+
+## Linear Regression
+set.seed(123)
+
+# Train Linear Regression
+lm_model <- lm(RUL ~ ., data = train_set)
+lm_pred <- predict(lm_model, test_set)
+lm_rmse <- sqrt(mean((lm_pred - test_set$RUL)^2))
+cat("Linear Regression RMSE:", lm_rmse, "\n")
+
+# Quick summary of the linear model
+summary_lm <- summary(lm_model)
+print(summary_lm$r.squared)
+
+```
+
+```{r}
+set.seed(123)
+
+# Train Decision Tree
+dt_model <- rpart(RUL ~ ., data = train_set, method = "anova")
+dt_pred <- predict(dt_model, test_set)
+dt_rmse <- sqrt(mean((dt_pred - test_set$RUL)^2))
+cat("Decision Tree RMSE:", dt_rmse, "\n")
+
+# Plot the decision tree
+rpart.plot(dt_model, main = "Decision Tree for RUL Prediction")
+```
+
+```{r}
+## Support Vector Machine (SVM)
+set.seed(123)
+
+# Normalize data for SVM (SVMs perform better with normalized data)
+preprocess_params <- preProcess(train_set %>% select(-RUL), method = c("center", "scale"))
+train_svm <- train_set
+train_svm[, names(train_svm) != "RUL"] <- predict(preprocess_params, train_set %>% select(-RUL))
+test_svm <- test_set
+test_svm[, names(test_svm) != "RUL"] <- predict(preprocess_params, test_set %>% select(-RUL))
+
+# Train SVM model with radial kernel
+# Using a smaller subset for training due to computational complexity if dataset is large
+if(nrow(train_svm) > 1000) {
+  train_idx <- sample(1:nrow(train_svm), 1000)
+  svm_train <- train_svm[train_idx,]
+} else {
+  svm_train <- train_svm
+}
+
+# Train the SVM model
+svm_model <- svm(RUL ~ ., data = svm_train, 
+                kernel = "radial", 
+                cost = 10,
+                gamma = 0.1)
+
+# Make predictions
+svm_pred <- predict(svm_model, test_svm)
+svm_rmse <- sqrt(mean((svm_pred - test_svm$RUL)^2))
+cat("SVM RMSE:", svm_rmse, "\n")
+
+# Plot the SVM model results
+plot(svm_pred ~ test_svm$RUL, 
+     main = "SVM Predictions vs Actual",
+     xlab = "Actual RUL", 
+     ylab = "Predicted RUL")
+abline(0, 1, col = "red", lwd = 2)
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```

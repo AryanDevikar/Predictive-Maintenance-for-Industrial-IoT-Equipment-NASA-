@@ -1,0 +1,873 @@
+---
+title: "project_testing"
+output: html_document
+date: "2025-05-03"
+---
+
+
+```{r}
+library(dplyr)
+library(caret)
+library(ggplot2)
+library(xgboost)
+library(randomForest)
+library(glmnet)
+library(e1071)
+library(keras)
+library(tidyr)
+library(tensorflow)
+library(lightgbm)
+library(zoo)
+```
+
+```{r}
+setwd("C:\\Users\\aryan\\Documents\\Rutgers\\Sem 2\\Finanicial Data Mining\\Project\\CMaps")
+```
+
+```{r}
+file_ids <- c("FD001", "FD002", "FD003", "FD004")
+file_types <- c("train", "test", "RUL")
+
+# Column names for train and test data
+columns <- c('unit_number', 'time_in_cycles', 'setting_1', 'setting_2', 'TRA', 'T2', 'T24', 'T30', 'T50',
+             'P2', 'P15', 'P30', 'Nf', 'Nc', 'epr', 'Ps30', 'phi', 'NRf', 'NRc', 'BPR', 'farB', 'htBleed',
+             'Nf_dmd', 'PCNfR_dmd', 'W31', 'W32')
+
+# Step 1: Convert TXT to CSV (handle space issues)
+for (file_type in file_types) {
+  for (file_id in file_ids) {
+    txt_file <- paste0(file_type, "_", file_id, ".txt")
+    csv_file <- paste0(file_type, "_", file_id, ".csv")
+    
+    if (file.exists(txt_file)) {
+      data <- read.table(txt_file, header = FALSE, sep = "", strip.white = TRUE)
+      write.csv(data, csv_file, row.names = FALSE)
+    }
+  }
+}
+```
+
+```{r}
+clean_csv <- function(df) {
+  df <- df[, colnames(df) != ""]
+  return(df)
+}
+```
+
+```{r}
+data_list <- list()
+for (file_type in file_types) {
+  for (file_id in file_ids) {
+    file_name <- paste0(file_type, "_", file_id, ".csv")
+    key <- paste0(file_type, "_", file_id)
+    
+    if (file.exists(file_name)) {
+      df <- read.csv(file_name, header = TRUE)
+      df <- clean_csv(df)
+      
+      # Add column names if train or test
+      if (file_type %in% c("train", "test")) {
+        colnames(df) <- columns
+      }
+      
+      data_list[[key]] <- df
+    }
+  }
+}
+
+```
+
+```{r}
+prepare_train_data <- function(data, factor = 0) {
+  fd_RUL <- data %>%
+    group_by(unit_number) %>%
+    summarize(max_time = max(time_in_cycles), .groups = 'drop')
+  
+  data <- merge(data, fd_RUL, by = "unit_number", all.x = TRUE)
+  data$RUL <- data$max_time - data$time_in_cycles
+  data <- subset(data, select = -max_time)
+  data <- data[data$time_in_cycles > factor, ]
+  
+  return(data)
+}
+
+```
+
+```{r}
+prepared_train_data <- lapply(names(data_list), function(name) {
+  if (startsWith(name, "train_")) {
+    prepare_train_data(data_list[[name]])
+  }
+})
+
+names(prepared_train_data) <- names(data_list)[startsWith(names(data_list), "train_")]
+
+```
+
+```{r}
+# Plot RUL distribution
+ggplot(prepared_train_data$train_FD001, aes(x=RUL)) +
+  geom_histogram(bins=100, fill="blue", alpha=0.7) +
+  labs(title="Distribution of Remaining Useful Life", x="RUL", y="Count")
+
+# Visualize sensor readings over time for a few units
+sample_units <- c(1, 2, 3)
+sample_data <- prepared_train_data$train_FD001 %>% 
+  filter(unit_number %in% sample_units)
+
+# Plot key sensor readings vs. time
+ggplot(sample_data, aes(x=time_in_cycles, y=T24, color=as.factor(unit_number))) +
+  geom_line() +
+  labs(title="Sensor T24 Readings Over Time", x="Cycles", y="T24 Value", color="Unit") +
+  theme_minimal()
+```
+
+```{r}
+str(prepared_train_data$train_FD001)
+summary(prepared_train_data$train_FD001)
+```
+
+```{r}
+hist(prepared_train_data$train_FD001$RUL, 
+     main="Distribution of RUL Values", 
+     xlab="Remaining Useful Life", 
+     col="lightblue", 
+     breaks=30)
+```
+
+```{r}
+plot_feature_distributions <- function(dataset, dataset_name) {
+  numeric_cols <- sapply(dataset, is.numeric)
+  numeric_data <- dataset[, numeric_cols]
+  
+  # Exclude unit_number, time_in_cycles, and RUL for sensor analysis
+  sensor_data <- numeric_data[, !names(numeric_data) %in% c("unit_number", "time_in_cycles", "RUL")]
+  
+  par(mfrow=c(3, 4))
+  for(col in names(sensor_data)) {
+    hist(sensor_data[[col]], 
+         main=paste("Distribution of", col), 
+         xlab=col, 
+         col="lightblue")
+  }
+  par(mfrow=c(1, 1))
+  title(main=paste("Feature Distributions for", dataset_name), outer=TRUE)
+}
+
+plot_feature_distributions(prepared_train_data$train_FD001, "FD001")
+```
+
+```{r}
+analyze_unit_degradation <- function(dataset, unit_ids, features) {
+  for(unit in unit_ids) {
+    unit_data <- dataset[dataset$unit_number == unit, ]
+    
+    plot_data <- unit_data[, c("time_in_cycles", features)]
+    plot_data_long <- tidyr::pivot_longer(plot_data, 
+                                      cols = all_of(features),
+                                      names_to = "feature", 
+                                      values_to = "value")
+    
+    ggplot(plot_data_long, aes(x = time_in_cycles, y = value, color = feature)) +
+      geom_line() +
+      facet_wrap(~ feature, scales = "free_y", ncol = 2) +
+      labs(title = paste("Sensor Values Over Time for Unit", unit),
+           x = "Time (cycles)",
+           y = "Sensor Value") +
+      theme_minimal()
+  }
+}
+
+# Analyze the first 3 units with all remaining sensors
+important_features <- setdiff(names(prepared_train_data$train_FD001), 
+                            c("unit_number", "time_in_cycles", "RUL"))
+analyze_unit_degradation(prepared_train_data$train_FD001, 1:3, important_features)
+```
+
+```{r}
+# Define all sensor features excluding metadata columns
+define_sensor_features <- function(dataset) {
+  # Get all numeric columns except unit_number, time_in_cycles, RUL
+  exclude_cols <- c('unit_number', 'time_in_cycles', 'RUL', 'max_time')
+  all_cols <- names(dataset)
+  sensor_cols <- setdiff(all_cols, exclude_cols)
+  
+  # Filter to only include numeric columns
+  numeric_sensor_cols <- sensor_cols[sapply(dataset[, sensor_cols, drop=FALSE], is.numeric)]
+  
+  return(numeric_sensor_cols)
+}
+
+# Apply this function to properly define sensor_features
+sensor_features <- define_sensor_features(prepared_train_data$train_FD001)
+
+feature_stats_by_unit <- function(dataset, features) {
+  dataset %>%
+    group_by(unit_number) %>%
+    summarize(across(all_of(features), 
+                    list(mean = mean, 
+                         sd = sd, 
+                         trend = ~cor(.x, time_in_cycles, use = "complete.obs"))))
+}
+
+non_constant_features <- sensor_features[sapply(sensor_features, function(f) sd(prepared_train_data$train_FD001[[f]]) > 0)]
+
+unit_stats <- feature_stats_by_unit(prepared_train_data$train_FD001, non_constant_features)
+head(unit_stats)
+```
+
+```{r}
+for (feature in sensor_features) {  
+  plot_data <- prepared_train_data$train_FD001[, c(feature, "RUL")]  
+  plot_data <- na.omit(plot_data)  # Remove NA rows  
+  plot_data <- plot_data[is.finite(plot_data[[feature]]) & is.finite(plot_data$RUL), ]  # Remove infinities  
+ 
+  if (sd(plot_data[[feature]]) > 0) {  # Ensure feature varies
+    plot(plot_data[[feature]], plot_data$RUL,  
+         main=paste("RUL vs", feature),  
+         xlab=feature, ylab="RUL",  
+         col="blue", pch=19, cex=0.5)  
+    abline(lm(RUL ~ ., data=plot_data), col="red")  
+  } else {  
+    message(paste("Skipping", feature, "due to zero variance"))  
+  }  
+}
+```
+
+```{r}
+compare_datasets <- function() {
+  results <- data.frame()
+  for(ds_name in names(prepared_train_data)) {
+    ds <- prepared_train_data[[ds_name]]
+    
+    # Basic metrics
+    n_units <- length(unique(ds$unit_number))
+    mean_rul <- mean(ds$RUL)
+    min_rul <- min(ds$RUL)
+    max_rul <- max(ds$RUL)
+    
+    # Add to results
+    results <- rbind(results, data.frame(
+      Dataset = ds_name,
+      Units = n_units,
+      Mean_RUL = mean_rul,
+      Min_RUL = min_rul,
+      Max_RUL = max_rul
+    ))
+  }
+  return(results)
+}
+
+dataset_comparison <- compare_datasets()
+print(dataset_comparison)
+```
+
+```{r}
+compute_rolling_stats <- function(dataset, window_size = 10) {
+  result_data <- dataset %>%
+    group_by(unit_number) %>%
+    arrange(unit_number, time_in_cycles) %>%
+    mutate(
+      # Rolling mean for each sensor
+      across(all_of(sensor_features), 
+             list(rolling_mean = ~zoo::rollmean(.x, k = window_size, fill = NA, align = "right")),
+             .names = "{.col}_rolling_mean"),
+      # Rolling standard deviation
+      across(all_of(sensor_features), 
+             list(rolling_sd = ~zoo::rollapply(.x, width = window_size, FUN = sd, fill = NA, align = "right")),
+             .names = "{.col}_rolling_sd"),
+      # Rate of change (slope over window)
+      across(all_of(sensor_features), 
+             list(slope = ~zoo::rollapply(.x, width = window_size, 
+                                         FUN = function(x) {
+                                           if(length(unique(x)) == 1) return(0)
+                                           return(coef(lm(x ~ seq_along(x)))[2])
+                                         }, 
+                                         fill = NA, align = "right")),
+             .names = "{.col}_slope")
+    )
+  
+  return(result_data)
+}
+
+# Apply to first dataset with a window of 10 cycles
+fd001_with_rolling <- compute_rolling_stats(prepared_train_data$train_FD001)
+```
+
+```{r}
+sample_unit <- 1
+sample_feature <- sensor_features[1]
+
+unit_data <- fd001_with_rolling[fd001_with_rolling$unit_number == sample_unit, ]
+plot(unit_data$time_in_cycles, unit_data[[sample_feature]], 
+     type="l", col="blue", 
+     main=paste("Original vs Rolling Features for Unit", sample_unit),
+     xlab="Cycles", ylab="Value")
+lines(unit_data$time_in_cycles, unit_data[[paste0(sample_feature, "_rolling_mean")]], col="red", lwd=2)
+legend("topright", legend=c("Original", "Rolling Mean"), 
+       col=c("blue", "red"), lty=1)
+```
+
+```{r}
+set.seed(123)
+
+# Take a clean subset for modeling
+model_data <- na.omit(fd001_with_rolling)
+# Select some columns to avoid memory issues
+selected_cols <- c(
+  "RUL", 
+  sensor_features,
+  paste0(sensor_features, "_rolling_mean"),
+  paste0(sensor_features, "_slope")
+)
+model_data <- model_data[, selected_cols]
+
+# Train a basic random forest to get feature importance
+rf_model <- randomForest(RUL ~ ., data=model_data, ntree=50, importance=TRUE)
+feature_importance <- importance(rf_model)
+feature_importance <- data.frame(
+  Feature = rownames(feature_importance),
+  Importance = feature_importance[, "%IncMSE"]
+)
+feature_importance <- feature_importance[order(feature_importance$Importance, decreasing=TRUE), ]
+
+# Visualize top 15 most important features
+ggplot(head(feature_importance, 15), aes(x=reorder(Feature, Importance), y=Importance)) +
+  geom_bar(stat="identity", fill="steelblue") +
+  coord_flip() +
+  labs(title="Top 15 Features by Importance",
+       x="Feature",
+       y="Importance (%IncMSE)") +
+  theme_minimal()
+```
+
+
+```{r}
+prepare_model_data <- function(dataset, features_to_use) {
+  # Make sure features_to_use exist in the dataset
+  features_to_use <- intersect(features_to_use, colnames(dataset))
+  
+  if (length(features_to_use) == 0) {
+    stop("No valid features provided for modeling")
+  }
+  
+  # Ensure RUL column exists
+  if (!"RUL" %in% colnames(dataset)) {
+    stop("RUL column not found in dataset")
+  }
+  
+  # Include unit_number, time_in_cycles, RUL and the specified features
+  cols_to_use <- unique(c("unit_number", "time_in_cycles", "RUL", features_to_use))
+  cols_to_use <- intersect(cols_to_use, colnames(dataset))  # Ensure all columns exist
+  
+  # Remove NA values
+  model_data <- na.omit(dataset[, cols_to_use])
+  
+  # Check if we have enough data
+  if (nrow(model_data) < 10) {
+    stop("Not enough data after removing NA values")
+  }
+  
+  # Split by units to avoid data leakage
+  all_units <- unique(model_data$unit_number)
+  
+  if (length(all_units) < 2) {
+    stop("Need at least 2 units for train/validation split")
+  }
+  
+  set.seed(123)
+  train_size <- max(1, floor(0.7 * length(all_units)))
+  train_units <- sample(all_units, size = train_size)
+  val_units <- setdiff(all_units, train_units)
+  
+  # Create training and validation sets
+  train_data <- model_data[model_data$unit_number %in% train_units, ]
+  val_data <- model_data[model_data$unit_number %in% val_units, ]
+  
+  # If either set is empty, adjust the split
+  if (nrow(train_data) == 0 || nrow(val_data) == 0) {
+    # Just do a random split instead
+    set.seed(123)
+    train_idx <- sample(1:nrow(model_data), size = floor(0.7 * nrow(model_data)))
+    train_data <- model_data[train_idx, ]
+    val_data <- model_data[-train_idx, ]
+  }
+  
+  # Get features only (no unit_number or time_in_cycles) for modeling
+  train_data_x <- train_data[, !(names(train_data) %in% c("unit_number", "time_in_cycles"))]
+  val_data_x <- val_data[, !(names(val_data) %in% c("unit_number", "time_in_cycles"))]
+  
+  return(list(
+    train_data = train_data,
+    val_data = val_data,
+    train_data_x = train_data_x,
+    val_data_x = val_data_x
+  ))
+}
+```
+
+```{r}
+get_important_features <- function(data, top_n = 20) {
+  set.seed(123)
+  
+  # Remove non-numeric columns and those that shouldn't be used as features
+  cols_to_exclude <- c("unit_number", "time_in_cycles")
+  feature_cols <- setdiff(names(data), cols_to_exclude)
+  
+  # Make sure we have the RUL column
+  if (!"RUL" %in% names(data)) {
+    stop("RUL column not found in the dataset")
+  }
+  
+  # Keep only numeric columns for modeling
+  is_numeric <- sapply(data[, feature_cols, drop=FALSE], is.numeric)
+  feature_cols <- feature_cols[is_numeric]
+  
+  # Remove any columns with all NAs or constant values
+  valid_cols <- c()
+  for (col in feature_cols) {
+    if (!all(is.na(data[[col]])) && sd(data[[col]], na.rm = TRUE) > 0) {
+      valid_cols <- c(valid_cols, col)
+    }
+  }
+  
+  # If we don't have enough valid columns, return what we have
+  if (length(valid_cols) == 0) {
+    message("No valid feature columns found")
+    return(list(
+      top_features = character(0),
+      importance_df = data.frame(Feature = character(0), Importance = numeric(0))
+    ))
+  }
+  
+  # Prepare formula for randomForest
+  formula_str <- paste("RUL ~", paste(valid_cols, collapse = " + "))
+  rf_formula <- as.formula(formula_str)
+  
+  # Run random forest with error handling
+  tryCatch({
+    rf_model <- randomForest(rf_formula, data = data, 
+                           ntree = 50, importance = TRUE)
+    
+    feature_importance <- importance(rf_model)
+    feature_importance_df <- data.frame(
+      Feature = rownames(feature_importance),
+      Importance = feature_importance[, "%IncMSE"]
+    )
+    feature_importance_df <- feature_importance_df[order(feature_importance_df$Importance, decreasing = TRUE), ]
+    
+    # Get top N features or all if fewer than top_n
+    n_to_select <- min(top_n, nrow(feature_importance_df))
+    top_features <- as.character(head(feature_importance_df$Feature, n_to_select))
+    
+    return(list(
+      top_features = top_features,
+      importance_df = feature_importance_df
+    ))
+  }, error = function(e) {
+    message(paste("Error in random forest feature selection:", e$message))
+    # Return all valid columns if RF fails
+    return(list(
+      top_features = valid_cols,
+      importance_df = data.frame(Feature = valid_cols, Importance = rep(1, length(valid_cols)))
+    ))
+  })
+}
+```
+
+```{r}
+calculate_metrics <- function(actual, predicted) {
+  rmse <- sqrt(mean((actual - predicted)^2))
+  mae <- mean(abs(actual - predicted))
+  r_squared <- 1 - (sum((actual - predicted)^2) / sum((actual - mean(actual))^2))
+  
+  return(list(
+    RMSE = rmse,
+    MAE = mae,
+    R_squared = r_squared
+  ))
+}
+```
+
+```{r}
+train_evaluate_model <- function(train_data, val_data, model_type, params = NULL) {
+  x_train <- train_data[, !(names(train_data) %in% c("RUL"))]
+  y_train <- train_data$RUL
+  
+  x_val <- val_data[, !(names(val_data) %in% c("RUL"))]
+  y_val <- val_data$RUL
+  
+  start_time <- Sys.time()
+  
+  # Train model based on type
+  if (model_type == "rf") {
+    ntrees <- ifelse(is.null(params$ntrees), 500, params$ntrees)
+    mtry <- ifelse(is.null(params$mtry), floor(sqrt(ncol(x_train))), params$mtry)
+    
+    model <- randomForest(x = x_train, y = y_train, 
+                         ntree = ntrees, mtry = mtry, 
+                         importance = TRUE)
+    
+    train_pred <- predict(model, x_train)
+    val_pred <- predict(model, x_val)
+    
+  } else if (model_type == "xgb") {
+    # Convert data to xgb format
+    dtrain <- xgb.DMatrix(data = as.matrix(x_train), label = y_train)
+    dval <- xgb.DMatrix(data = as.matrix(x_val), label = y_val)
+    
+    # Default params
+    xgb_params <- list(
+      objective = "reg:squarederror",
+      eta = ifelse(is.null(params$eta), 0.1, params$eta),
+      max_depth = ifelse(is.null(params$max_depth), 6, params$max_depth),
+      subsample = ifelse(is.null(params$subsample), 0.8, params$subsample),
+      colsample_bytree = ifelse(is.null(params$colsample_bytree), 0.8, params$colsample_bytree)
+    )
+    
+    watchlist <- list(train = dtrain, val = dval)
+    
+    model <- xgb.train(
+      params = xgb_params,
+      data = dtrain,
+      nrounds = ifelse(is.null(params$nrounds), 100, params$nrounds),
+      watchlist = watchlist,
+      early_stopping_rounds = 10,
+      verbose = 0
+    )
+    
+    train_pred <- predict(model, dtrain)
+    val_pred <- predict(model, dval)
+    
+  } else if (model_type == "elastic_net") {
+    # Normalize data
+    x_train_matrix <- as.matrix(x_train)
+    x_val_matrix <- as.matrix(x_val)
+    
+    alpha <- ifelse(is.null(params$alpha), 0.5, params$alpha)
+    
+    # Cross-validation to find optimal lambda
+    cv_model <- cv.glmnet(x_train_matrix, y_train, alpha = alpha)
+    
+    # Use lambda.min or lambda.1se
+    lambda <- cv_model$lambda.min
+    
+    model <- glmnet(x_train_matrix, y_train, alpha = alpha, lambda = lambda)
+    
+    train_pred <- predict(model, x_train_matrix, s = lambda)
+    val_pred <- predict(model, x_val_matrix, s = lambda)
+    
+  } else if (model_type == "lightgbm") {
+    # Convert data to lgb format
+    dtrain <- lgb.Dataset(data = as.matrix(x_train), label = y_train)
+    
+    # Default params
+    lgb_params <- list(
+      objective = "regression",
+      metric = "rmse",
+      learning_rate = ifelse(is.null(params$learning_rate), 0.1, params$learning_rate),
+      num_leaves = ifelse(is.null(params$num_leaves), 31, params$num_leaves),
+      feature_fraction = ifelse(is.null(params$feature_fraction), 0.8, params$feature_fraction)
+    )
+    
+    model <- lgb.train(
+      params = lgb_params,
+      data = dtrain,
+      nrounds = ifelse(is.null(params$nrounds), 100, params$nrounds),
+      verbose = -1
+    )
+    
+    train_pred <- predict(model, as.matrix(x_train))
+    val_pred <- predict(model, as.matrix(x_val))
+  }
+  
+  end_time <- Sys.time()
+  training_time <- difftime(end_time, start_time, units = "secs")
+  
+  # Calculate metrics
+  train_metrics <- calculate_metrics(y_train, train_pred)
+  val_metrics <- calculate_metrics(y_val, val_pred)
+  
+  return(list(
+    model = model,
+    training_time = training_time,
+    train_metrics = train_metrics,
+    val_metrics = val_metrics,
+    train_pred = train_pred,
+    val_pred = val_pred,
+    actual_train = y_train,
+    actual_val = y_val
+  ))
+}
+```
+
+```{r}
+run_model_assessment <- function() {
+  results_table <- data.frame()
+  
+  for (ds_name in names(prepared_train_data)) {
+    # Get dataset with engineered features
+    dataset <- compute_rolling_stats(prepared_train_data[[ds_name]])
+    
+    # Remove NA values before feature selection
+    dataset <- na.omit(dataset)
+    
+    # Get important features
+    feature_results <- get_important_features(dataset, top_n = 20)
+    top_features <- feature_results$top_features
+    
+    # Make sure we have the required columns in the dataset
+    if (!all(top_features %in% colnames(dataset))) {
+      message(paste("Some top features are missing in", ds_name, "- using available features only"))
+      top_features <- top_features[top_features %in% colnames(dataset)]
+    }
+    
+    # Skip if no features are available
+    if (length(top_features) == 0) {
+      message(paste("No valid features for", ds_name, "- skipping this dataset"))
+      next
+    }
+    
+    # Prepare data for modeling
+    model_data <- prepare_model_data(dataset, top_features)
+    
+    # Check if we have enough data
+    if (nrow(model_data$train_data_x) < 10 || nrow(model_data$val_data_x) < 10) {
+      message(paste("Not enough data for", ds_name, "after preparation - skipping this dataset"))
+      next
+    }
+    
+    # Train and evaluate different models
+    models_to_test <- list(
+      rf = list(ntrees = 200, mtry = min(5, length(top_features)-1)), # Ensure mtry is not larger than available features
+      xgb = list(eta = 0.05, max_depth = 5, nrounds = 200),
+      elastic_net = list(alpha = 0.5),
+      lightgbm = list(learning_rate = 0.05, num_leaves = 31, nrounds = 200)
+    )
+    
+    for (model_name in names(models_to_test)) {
+      tryCatch({
+        results <- train_evaluate_model(
+          model_data$train_data_x, 
+          model_data$val_data_x, 
+          model_type = model_name,
+          params = models_to_test[[model_name]]
+        )
+        
+        # Add to results table
+        results_table <- rbind(results_table, data.frame(
+          Dataset = ds_name,
+          Model = model_name,
+          RMSE_Train = results$train_metrics$RMSE,
+          RMSE_Val = results$val_metrics$RMSE,
+          MAE_Train = results$train_metrics$MAE,
+          MAE_Val = results$val_metrics$MAE,
+          R2_Train = results$train_metrics$R_squared,
+          R2_Val = results$val_metrics$R_squared,
+          Training_Time_Sec = as.numeric(results$training_time)
+        ))
+        
+        # Visualize predictions vs actual for validation set
+        val_results <- data.frame(
+          Actual = results$actual_val,
+          Predicted = results$val_pred
+        )
+        
+        plot_title <- paste("Actual vs Predicted RUL -", ds_name, "-", model_name)
+        
+        p <- ggplot(val_results, aes(x = Actual, y = Predicted)) +
+          geom_point(alpha = 0.5, color = "blue") +
+          geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+          labs(title = plot_title,
+               x = "Actual RUL",
+               y = "Predicted RUL") +
+          theme_minimal() +
+          annotate("text", x = min(val_results$Actual), y = max(val_results$Predicted),
+                  label = paste("RMSE:", round(results$val_metrics$RMSE, 2),
+                               "\nMAE:", round(results$val_metrics$MAE, 2),
+                               "\nR²:", round(results$val_metrics$R_squared, 3)),
+                  hjust = 0, vjust = 1)
+        
+        print(p)
+      }, error = function(e) {
+        message(paste("Error in", model_name, "for", ds_name, ":", e$message))
+      })
+    }
+  }
+  
+  return(results_table)
+}
+
+```
+
+```{r}
+# After you've prepared your train data:
+
+# 1. Define sensor features dynamically based on your data
+sensor_features <- define_sensor_features(prepared_train_data$train_FD001)
+print("Identified sensor features:")
+print(sensor_features)
+
+# 2. First compute rolling statistics for one dataset to test
+fd001_with_rolling <- compute_rolling_stats(prepared_train_data$train_FD001)
+print(paste("Original columns:", ncol(prepared_train_data$train_FD001), 
+           "After rolling stats:", ncol(fd001_with_rolling)))
+
+# 3. Run a test on just one model to make sure everything works
+test_dataset <- na.omit(fd001_with_rolling)
+test_features <- get_important_features(test_dataset, top_n = 10)
+print("Top 10 features:")
+print(test_features$top_features)
+
+# 4. Test prepare_model_data function
+test_model_data <- prepare_model_data(test_dataset, test_features$top_features)
+print(paste("Training samples:", nrow(test_model_data$train_data_x),
+           "Validation samples:", nrow(test_model_data$val_data_x)))
+
+# 5. Test one model
+test_results <- train_evaluate_model(
+  test_model_data$train_data_x,
+  test_model_data$val_data_x,
+  model_type = "rf",
+  params = list(ntrees = 50, mtry = 3)
+)
+print("Test model metrics:")
+print(test_results$val_metrics)
+
+# 6. Only if all the above works properly, run the full assessment
+model_results <- run_model_assessment()
+
+# 7. Visualize results
+ggplot(model_results, aes(x = Model, y = RMSE_Val, fill = Dataset)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Model Performance Comparison",
+       x = "Model Type",
+       y = "Validation RMSE") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+model_results <- run_model_assessment()
+
+# Visualize model comparison
+ggplot(model_results, aes(x = Model, y = RMSE_Val, fill = Dataset)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Model Performance Comparison",
+       x = "Model Type",
+       y = "Validation RMSE") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```

@@ -1,0 +1,465 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r}
+library(dplyr)
+library(caret)
+library(ggplot2)
+library(xgboost)
+library(randomForest)
+library(glmnet)
+library(e1071)
+library(keras)
+library(tidyr)
+library(tensorflow)
+library(lightgbm)
+```
+
+
+```{r}
+setwd("C:\\Users\\aryan\\Documents\\Rutgers\\Sem 2\\Finanicial Data Mining\\Project\\CMaps")
+```
+
+```{r}
+file_ids <- c("FD001", "FD002", "FD003", "FD004")
+file_types <- c("train", "test", "RUL")
+
+for (file_type in file_types) {
+  for (file_id in file_ids) {
+    txt_file <- paste0(file_type, "_", file_id, ".txt")
+    csv_file <- paste0(file_type, "_", file_id, ".csv")
+    
+    data <- read.table(txt_file, header = FALSE, sep = " ")
+    write.csv(data, csv_file, row.names = FALSE)
+  }
+}
+
+```
+
+```{r}
+train_data_001 <- read.csv("train_FD001.csv", header = TRUE)
+test_data_001 <- read.csv("test_FD001.csv", header = TRUE)
+
+columns <- c('unit_number', 'time_in_cycles', 'setting_1', 'setting_2', 'TRA', 'T2', 'T24', 'T30', 'T50',
+             'P2', 'P15', 'P30', 'Nf', 'Nc', 'epr', 'Ps30', 'phi', 'NRf', 'NRc', 'BPR', 'farB', 'htBleed',
+             'Nf_dmd', 'PCNfR_dmd', 'W31', 'W32')
+colnames(train_data_001) <- columns
+colnames(test_data_001) <- columns
+
+head(train_data_001)
+```
+
+```{r}
+summary(train_data_001)
+```
+
+```{r}
+# Removing the columns that are constant or close to constant
+train_data_001 <- train_data_001[ ,-c(5,6,10,11,13,14,15,18,21,23,24,27,28)]
+head(train_data_001)
+summary(train_data_001)
+```
+
+```{r}
+library(dplyr)
+prepare_train_data <- function(data, factor = 0) {
+  fd_RUL <- data %>%
+    group_by(unit_number) %>%
+    summarize(max_time = max(time_in_cycles), .groups = 'drop') # Calculate max per unit_number
+  
+  data <- merge(data, fd_RUL, by = "unit_number", all.x = TRUE)
+  data$RUL <- data$max_time - data$time_in_cycles
+  data <- subset(data, select = -max_time)
+  data <- data[data$time_in_cycles > factor, ]
+  
+  return(data)
+}
+
+train_fd001 <- prepare_train_data(train_data_001)
+```
+
+```{r}
+library(ggplot2)
+library(reshape2)  
+
+df_cor <- cor(train_fd001)  
+
+# Convert the correlation matrix into a long format
+melted_cor <- melt(df_cor)
+
+ggplot(melted_cor, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white", linewidth = 0.2) +  # Add linewidths
+  scale_fill_gradient2(low = "red", high = "green", mid = "yellow",
+                       midpoint = 0, limit = c(-1, 1), space = "Lab",
+                       name = "Correlation") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 1, hjust = 1),
+    axis.text.y = element_text(size = 12)
+  ) +
+  coord_fixed()
+```
+
+```{r}
+library(tidyr)
+unit1_data <- train_fd001 %>% 
+  filter(unit_number == 1)
+
+# Plot sensor trends over engine cycles for a single unit
+plot_sensor_trends <- function(data, unit_num) {
+  unit_data <- data %>% filter(unit_number == unit_num)
+  
+  # Select only sensor columns
+  sensor_cols <- setdiff(names(unit_data), c("unit_number", "time_in_cycles", "RUL", "setting_1", "setting_2"))
+  
+  # Reshape data for plotting
+  unit_data_long <- unit_data %>% pivot_longer(cols = all_of(sensor_cols), 
+                 names_to = "Sensor", 
+                 values_to = "Value")
+  
+  # Create plots
+  ggplot(unit_data_long, aes(x = time_in_cycles, y = Value)) +
+    geom_line(aes(color = Sensor), linewidth = 1) +
+    facet_wrap(~ Sensor, scales = "free_y") +
+    labs(title = paste("Sensor Trends for Unit", unit_num),
+         x = "Time (Cycles)",
+         y = "Sensor Value") +
+    theme_minimal() +
+    theme(legend.position = "none")
+}
+
+# Plot sensor trends for unit 1
+plot_sensor_trends(train_fd001, 1)
+```
+
+```{r}
+unit_cycles <- train_fd001 %>%
+  group_by(unit_number) %>%
+  summarize(max_cycles = max(time_in_cycles)) %>%
+  arrange(max_cycles)
+
+# Select units from different parts of the distribution
+short_life_unit <- unit_cycles$unit_number[1]
+medium_life_unit <- unit_cycles$unit_number[round(nrow(unit_cycles)/2)]
+long_life_unit <- unit_cycles$unit_number[nrow(unit_cycles)]
+
+# Create dataset with these selected units
+selected_units <- train_fd001 %>%
+  filter(unit_number %in% c(short_life_unit, medium_life_unit, long_life_unit))
+
+# Plot RUL over time for selected units
+ggplot(selected_units, aes(x = time_in_cycles, y = RUL, color = as.factor(unit_number))) +
+  geom_line(linewidth = 1) +
+  labs(title = "Full Life Cycles - Different Engine Units",
+       x = "Time (Cycles)",
+       y = "Remaining Useful Life (RUL)",
+       color = "Unit Number") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set1") +
+  annotate("text", 
+           x = max(selected_units$time_in_cycles) * 0.8, 
+           y = max(selected_units$RUL) * 0.8,
+           label = paste("Short life unit:", short_life_unit,
+                        "\nMedium life unit:", medium_life_unit,
+                        "\nLong life unit:", long_life_unit),
+           size = 4)
+
+```
+
+```{r}
+truncate_lifecycle <- function(data, unit_num, percentage) {
+  unit_data <- data %>% filter(unit_number == unit_num)
+  max_cycle <- max(unit_data$time_in_cycles)
+  truncated_cycle <- round(max_cycle * percentage)
+  
+  truncated_data <- unit_data %>% 
+    filter(time_in_cycles <= truncated_cycle)
+  
+  return(truncated_data)
+}
+
+# Select a unit for demonstration
+demo_unit <- 3
+full_lifecycle <- train_fd001 %>% filter(unit_number == demo_unit)
+truncated_25 <- truncate_lifecycle(train_fd001, demo_unit, 0.25)
+truncated_50 <- truncate_lifecycle(train_fd001, demo_unit, 0.50)
+truncated_75 <- truncate_lifecycle(train_fd001, demo_unit, 0.75)
+
+# Combine datasets with a label
+truncated_data <- bind_rows(
+  mutate(full_lifecycle, Truncation = "100% (Full)"),
+  mutate(truncated_75, Truncation = "75%"),
+  mutate(truncated_50, Truncation = "50%"),
+  mutate(truncated_25, Truncation = "25%")
+)
+
+# Plot truncated lifecycles
+ggplot(truncated_data, aes(x = time_in_cycles, y = RUL, color = Truncation)) +
+  geom_line(linewidth = 1) +
+  labs(title = paste("Truncated Life Cycles - Unit", demo_unit),
+       x = "Time (Cycles)",
+       y = "Remaining Useful Life (RUL)") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Set2")
+```
+
+
+```{r}
+cor_with_rul <- df_cor["RUL", ]
+cor_with_rul <- sort(cor_with_rul[!names(cor_with_rul) %in% c("RUL", "unit_number", "time_in_cycles")])
+top_sensors <- names(tail(cor_with_rul, 5))
+bottom_sensors <- names(head(cor_with_rul, 5))
+
+# Plot top correlated sensors for a few units
+key_sensors <- train_fd001 %>%
+  filter(unit_number %in% c(1, 5, 10)) %>%
+  select(unit_number, time_in_cycles, RUL, all_of(top_sensors)) %>%
+  pivot_longer(cols = all_of(top_sensors), 
+               names_to = "Sensor", 
+               values_to = "Value")
+
+ggplot(key_sensors, aes(x = time_in_cycles, y = Value, color = Sensor)) +
+  geom_line(linewidth = 1) +
+  facet_grid(Sensor ~ unit_number, scales = "free_y") +
+  labs(title = "Top Sensors Correlated with RUL",
+       x = "Time (Cycles)",
+       y = "Sensor Value") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
+```{r}
+scoring_function <- function(actual, predicted) {
+  diff <- predicted - actual
+  score <- numeric(length(diff))
+  
+  score[diff < 0] <- exp(-diff[diff < 0]/13) - 1
+  
+  score[diff >= 0] <- exp(diff[diff >= 0]/10) - 1
+  
+  return(mean(score))
+}
+```
+
+```{r}
+engineer_features <- function(data, window_sizes = c(5, 10, 15)) {
+  result <- data
+  
+  sensor_cols <- setdiff(names(data), c("unit_number", "time_in_cycles", "RUL", "setting_1", "setting_2"))
+  
+  units <- unique(data$unit_number)
+  
+  feature_dfs <- list()
+  
+  for (unit in units) {
+    unit_data <- data[data$unit_number == unit, ]
+    unit_features <- unit_data
+    
+    for (sensor in sensor_cols) {
+      for (window in window_sizes) {
+        if (nrow(unit_data) >= window) {
+          col_name <- paste0(sensor, "_rolling_avg_", window)
+          unit_features[[col_name]] <- c(rep(NA, window-1), 
+                                         stats::filter(unit_data[[sensor]], rep(1/window, window), sides = 1)[(window):length(unit_data[[sensor]])])
+        }
+      }
+      
+      # Calculate differences (rate of change)
+      col_name <- paste0(sensor, "_diff")
+      unit_features[[col_name]] <- c(NA, diff(unit_data[[sensor]]))
+      
+      # Calculate percent change
+      col_name <- paste0(sensor, "_pct_change")
+      unit_features[[col_name]] <- c(NA, diff(unit_data[[sensor]]) / unit_data[[sensor]][-nrow(unit_data)] * 100)
+      
+      # Calculate moving standard deviation (volatility)
+      for (window in window_sizes) {
+        if (nrow(unit_data) >= window) {
+          col_name <- paste0(sensor, "_rolling_std_", window)
+          roll_sd <- sapply(1:(nrow(unit_data) - window + 1), function(i) {
+            sd(unit_data[[sensor]][i:(i+window-1)])
+          })
+          unit_features[[col_name]] <- c(rep(NA, window-1), roll_sd)
+        }
+      }
+    }
+    
+    # Time-based features
+    # Normalized cycle (0 to 1 within each unit's lifecycle)
+    unit_features$norm_cycle <- unit_data$time_in_cycles / max(unit_data$time_in_cycles)
+    
+    # Add to list of processed units
+    feature_dfs[[length(feature_dfs) + 1]] <- unit_features
+  }
+  
+  # Combine all units back together
+  result <- do.call(rbind, feature_dfs)
+  
+  # Remove NA values (from rolling calculations)
+  # For real applications, consider more sophisticated approaches than simple removal
+  result <- result[complete.cases(result), ]
+  
+  return(result)
+}
+
+# Apply feature engineering
+engineered_data <- engineer_features(train_fd001)
+```
+
+```{r}
+# Function for k-fold cross-validation
+kfold_cv <- function(data, k = 5, seed = 42) {
+  set.seed(seed)
+  units <- unique(data$unit_number)
+  folds <- createFolds(units, k = k, list = TRUE, returnTrain = FALSE)
+  
+  fold_data <- list()
+  for (i in 1:k) {
+    test_units <- units[folds[[i]]]
+    train_units <- setdiff(units, test_units)
+    
+    train_data <- data[data$unit_number %in% train_units, ]
+    test_data <- data[data$unit_number %in% test_units, ]
+    
+    fold_data[[i]] <- list(train = train_data, test = test_data)
+  }
+  
+  return(fold_data)
+}
+
+# Function for leave-one-unit-out cross-validation (LOUO)
+louo_cv <- function(data) {
+  units <- unique(data$unit_number)
+  folds <- length(units)
+  
+  fold_data <- list()
+  for (i in 1:folds) {
+    test_unit <- units[i]
+    train_units <- setdiff(units, test_unit)
+    
+    train_data <- data[data$unit_number %in% train_units, ]
+    test_data <- data[data$unit_number %in% test_unit, ]
+    
+    fold_data[[i]] <- list(train = train_data, test = test_data)
+  }
+  
+  return(fold_data)
+}
+
+# Apply k-fold CV
+cv_folds <- kfold_cv(engineered_data, k = 5)
+
+```
+
+```{r}
+# Prepare X and y for machine learning models
+prepare_ml_data <- function(data) {
+  # Remove non-feature columns
+  X <- data %>% select(-c(unit_number, time_in_cycles, RUL))
+  y <- data$RUL
+  
+  # Convert to matrix/vector for some models
+  X_matrix <- as.matrix(X)
+  
+  return(list(X = X, X_matrix = X_matrix, y = y))
+}
+
+# Utility function to evaluate and report metrics
+evaluate_model <- function(actual, predicted, model_name) {
+  rmse <- sqrt(mean((predicted - actual)^2))
+  mae <- mean(abs(predicted - actual))
+  score <- scoring_function(actual, predicted)
+  
+  cat(paste0("\n", model_name, " Performance:\n"))
+  cat(paste0("RMSE: ", round(rmse, 4), "\n"))
+  cat(paste0("MAE: ", round(mae, 4), "\n"))
+  cat(paste0("PHM08 Score: ", round(score, 4), "\n"))
+  
+  return(data.frame(model = model_name, rmse = rmse, mae = mae, score = score))
+}
+
+# Function to calculate performance across all folds
+cross_validate_model <- function(model_fn, folds, model_name) {
+  results <- data.frame()
+  fold_metrics <- list()
+  
+  for (i in 1:length(folds)) {
+    cat(paste0("\nFold ", i, " for ", model_name, "\n"))
+    
+    # Prepare data
+    train_data <- prepare_ml_data(folds[[i]]$train)
+    test_data <- prepare_ml_data(folds[[i]]$test)
+    
+    # Train and predict
+    model <- model_fn(train_data$X_matrix, train_data$y)
+    predictions <- predict(model, test_data$X_matrix)
+    
+    # Evaluate
+    fold_metrics[[i]] <- evaluate_model(test_data$y, predictions, paste0(model_name, " Fold ", i))
+  }
+  
+  # Combine results
+  all_metrics <- do.call(rbind, fold_metrics)
+  
+  # Calculate mean metrics
+  mean_metrics <- all_metrics %>%
+    summarize(
+      model = first(model),
+      mean_rmse = mean(rmse),
+      mean_mae = mean(mae),
+      mean_score = mean(score)
+    )
+  
+  return(list(fold_metrics = all_metrics, summary = mean_metrics))
+}
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
